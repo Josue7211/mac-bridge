@@ -240,6 +240,57 @@ app.get('/contacts/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
+// ── Contact photo by phone/email ─────────────────────────────────
+
+app.get('/contacts/photo', async (req, res) => {
+  try {
+    const address = req.query.address
+    if (!address) return res.status(400).json({ error: 'address required' })
+
+    const safe = address.replace(/[^a-zA-Z0-9@.+\- ]/g, '')
+    const digits = safe.replace(/\D/g, '')
+    const last10 = digits.length >= 10 ? digits.slice(-10) : digits
+
+    // Try to find contact photo via AppleScript
+    const tmpFile = `/tmp/mc-avatar-${last10 || safe.replace(/[^a-z0-9]/gi, '')}.tiff`
+    const script = `
+      tell application "Contacts"
+        set matchList to {}
+        repeat with p in every person
+          repeat with ph in phones of p
+            set phDigits to do shell script "echo " & quoted form of (value of ph) & " | tr -cd '0-9'"
+            if phDigits ends with "${last10}" then
+              set end of matchList to p
+              exit repeat
+            end if
+          end repeat
+        end repeat
+        if (count of matchList) > 0 then
+          set thePerson to item 1 of matchList
+          try
+            set theImage to image of thePerson
+            if theImage is not missing value then
+              set fRef to open for access POSIX file "${tmpFile}" with write permission
+              set eof fRef to 0
+              write theImage to fRef
+              close access fRef
+              return "ok"
+            end if
+          end try
+        end if
+        return "no_photo"
+      end tell
+    `
+    const result = await osascript(script)
+    if (result === 'no_photo') {
+      return res.status(404).json({ error: 'no_photo' })
+    }
+    res.sendFile(tmpFile)
+  } catch (err) {
+    res.status(404).json({ error: err.message })
+  }
+})
+
 // ═══════════════════════════════════════════════════════════════════
 // FIND MY
 // ═══════════════════════════════════════════════════════════════════
