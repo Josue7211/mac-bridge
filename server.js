@@ -1,12 +1,16 @@
 import express from 'express'
-import { execFile, exec as execCb } from 'child_process'
+import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { homedir } from 'os'
 import { join } from 'path'
 
 const execFileP = promisify(execFile)
-const execP = promisify(execCb)
 const app = express()
+
+// Sanitize user input for safe interpolation into JXA/AppleScript double-quoted strings
+function safeJxaString(s) {
+  return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '')
+}
 app.use(express.json())
 
 const PORT = process.env.BRIDGE_PORT || 4100
@@ -31,12 +35,12 @@ async function remindctl(...args) {
 }
 
 async function osascript(script) {
-  const { stdout } = await execP(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: 15000 })
+  const { stdout } = await execFileP('osascript', ['-e', script], { timeout: 15000 })
   return stdout.trim()
 }
 
 async function jxa(script) {
-  const { stdout } = await execP(`osascript -l JavaScript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: 15000 })
+  const { stdout } = await execFileP('osascript', ['-l', 'JavaScript', '-e', script], { timeout: 15000 })
   return JSON.parse(stdout)
 }
 
@@ -106,7 +110,7 @@ app.get('/notes', async (req, res) => {
     if (search) {
       script = `
         const Notes = Application("Notes");
-        const results = Notes.notes.whose({name: {_contains: "${search.replace(/"/g, '\\"')}"}})();
+        const results = Notes.notes.whose({name: {_contains: "${safeJxaString(search)}"}})();
         JSON.stringify(results.slice(0, ${limit}).map(n => ({
           id: n.id(), name: n.name(), body: n.plaintext().substring(0, 200),
           folder: n.container().name(), created: n.creationDate().toISOString(),
@@ -116,11 +120,11 @@ app.get('/notes', async (req, res) => {
     } else if (folder) {
       script = `
         const Notes = Application("Notes");
-        const f = Notes.folders.byName("${folder.replace(/"/g, '\\"')}");
+        const f = Notes.folders.byName("${safeJxaString(folder)}");
         const notes = f.notes();
         JSON.stringify(notes.slice(0, ${limit}).map(n => ({
           id: n.id(), name: n.name(), body: n.plaintext().substring(0, 200),
-          folder: "${folder}", created: n.creationDate().toISOString(),
+          folder: "${safeJxaString(folder)}", created: n.creationDate().toISOString(),
           modified: n.modificationDate().toISOString()
         })))
       `
@@ -151,7 +155,7 @@ app.get('/notes/folders', async (_req, res) => {
 
 app.get('/notes/:id', async (req, res) => {
   try {
-    const id = req.params.id.replace(/"/g, '\\"')
+    const id = safeJxaString(req.params.id)
     const script = `
       const Notes = Application("Notes");
       const n = Notes.notes.byId("${id}");
@@ -170,10 +174,10 @@ app.post('/notes', async (req, res) => {
   try {
     const { title, body, folder } = req.body
     if (!title) return res.status(400).json({ error: 'title required' })
-    const safeTitle = title.replace(/"/g, '\\"')
-    const safeBody = (body || '').replace(/"/g, '\\"')
+    const safeTitle = safeJxaString(title)
+    const safeBody = safeJxaString(body || '')
     const target = folder
-      ? `folder "${folder.replace(/"/g, '\\"')}" of application "Notes"`
+      ? `folder "${safeJxaString(folder)}" of application "Notes"`
       : 'default account of application "Notes"'
     await osascript(`tell application "Notes" to make new note at ${target} with properties {name:"${safeTitle}", body:"${safeBody}"}`)
     res.json({ ok: true })
@@ -190,7 +194,7 @@ app.get('/contacts', async (req, res) => {
     const limit = parseInt(req.query.limit) || 30
     let script
     if (search) {
-      const safe = search.replace(/"/g, '\\"')
+      const safe = safeJxaString(search)
       script = `
         const Contacts = Application("Contacts");
         const people = Contacts.people.whose({_or: [
@@ -288,7 +292,7 @@ app.get('/contacts/photo', (req, res) => {
 
 app.get('/contacts/:id', async (req, res) => {
   try {
-    const id = req.params.id.replace(/"/g, '\\"')
+    const id = safeJxaString(req.params.id)
     const script = `
       const Contacts = Application("Contacts");
       const p = Contacts.people.byId("${id}");
@@ -355,8 +359,48 @@ app.get('/findmy/devices', async (_req, res) => {
       }))
       res.json(devices)
     } catch (err2) {
-      res.status(500).json({ error: 'Find My cache not available. Open Find My app on this Mac first. ' + err2.message })
+      res.status(500).json({ error: 'Find My cache not available. Open Find My app on this Mac first.' })
     }
+  }
+})
+
+// ── Messages — mark chat as read via sqlite3 on chat.db ────────────
+
+app.post('/messages/mark-read', async (req, res) => {
+  const { chatGuid } = req.body
+  if (!chatGuid || typeof chatGuid !== 'string') {
+    return res.status(400).json({ error: 'chatGuid required' })
+  }
+  // Validate chatGuid format to prevent injection (only allow safe chars)
+  if (!/^[a-zA-Z0-9_;+\-@.]+$/.test(chatGuid)) {
+    return res.status(400).json({ error: 'Invalid chatGuid format' })
+  }
+
+  try {
+    const { execFile: execFileCb } = await import('child_process')
+    const { promisify } = await import('util')
+    const execFileAsync = promisify(execFileCb)
+    const dbPath = join(HOME, 'Library/Messages/chat.db')
+
+    // date_read uses Apple Core Data nanoseconds since 2001-01-01
+    // 978307200 = seconds between Unix epoch (1970) and Apple epoch (2001)
+    const appleNow = (Math.floor(Date.now() / 1000) - 978307200) * 1000000000
+    // chatGuid is already validated by regex above (safe chars only)
+    const sql = `UPDATE message SET date_read = ${appleNow}
+      WHERE ROWID IN (
+        SELECT m.ROWID FROM message m
+        JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+        JOIN chat c ON c.ROWID = cmj.chat_id
+        WHERE c.guid = '${chatGuid}'
+        AND m.is_from_me = 0
+        AND m.date_read = 0
+      );`
+
+    await execFileAsync('sqlite3', [dbPath, sql])
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('mark-read error:', err.message)
+    res.status(500).json({ error: err.message })
   }
 })
 
