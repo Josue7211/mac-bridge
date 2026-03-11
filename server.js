@@ -218,36 +218,13 @@ app.get('/contacts', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-app.get('/contacts/:id', async (req, res) => {
-  try {
-    const id = req.params.id.replace(/"/g, '\\"')
-    const script = `
-      const Contacts = Application("Contacts");
-      const p = Contacts.people.byId("${id}");
-      JSON.stringify({
-        id: p.id(), name: p.name(),
-        firstName: p.firstName(), lastName: p.lastName(),
-        organization: p.organization(),
-        phones: p.phones().map(ph => ({label: ph.label(), value: ph.value()})),
-        emails: p.emails().map(e => ({label: e.label(), value: e.value()})),
-        addresses: p.addresses().map(a => ({
-          label: a.label(), street: a.street(), city: a.city(),
-          state: a.state(), zip: a.zip(), country: a.country()
-        }))
-      })
-    `
-    res.json(await jxa(script))
-  } catch (err) { res.status(500).json({ error: err.message }) }
-})
-
-// ── Contact photos ───────────────────────────────────────────────
+// ── Contact photos (must be before /contacts/:id) ────────────────
 
 // Map: last 7 digits → /tmp/mc-avatar-XXXXXXX.jpg
 const photoMap = new Map()
 let photosReady = false
 
 async function buildPhotoCache() {
-  // Swift tool that exports ALL contact photos to /tmp, prints JSON mapping
   const swiftSrc = `
 import Contacts
 import Foundation
@@ -289,11 +266,10 @@ print(String(data: jsonData, encoding: .utf8)!)
     console.log(`Photo cache built: ${photoMap.size} contact photos`)
   } catch (err) {
     console.warn('Photo cache build failed:', err.message)
-    photosReady = true // mark ready even on failure so requests don't hang
+    photosReady = true
   }
 }
 
-// Start building cache in background on startup
 buildPhotoCache()
 
 app.get('/contacts/photo', (req, res) => {
@@ -309,6 +285,28 @@ app.get('/contacts/photo', (req, res) => {
     return res.sendFile(photoPath)
   }
   res.status(404).json({ error: 'no_photo' })
+})
+
+app.get('/contacts/:id', async (req, res) => {
+  try {
+    const id = req.params.id.replace(/"/g, '\\"')
+    const script = `
+      const Contacts = Application("Contacts");
+      const p = Contacts.people.byId("${id}");
+      JSON.stringify({
+        id: p.id(), name: p.name(),
+        firstName: p.firstName(), lastName: p.lastName(),
+        organization: p.organization(),
+        phones: p.phones().map(ph => ({label: ph.label(), value: ph.value()})),
+        emails: p.emails().map(e => ({label: e.label(), value: e.value()})),
+        addresses: p.addresses().map(a => ({
+          label: a.label(), street: a.street(), city: a.city(),
+          state: a.state(), zip: a.zip(), country: a.country()
+        }))
+      })
+    `
+    res.json(await jxa(script))
+  } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
 // ═══════════════════════════════════════════════════════════════════
