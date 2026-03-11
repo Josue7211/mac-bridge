@@ -240,55 +240,75 @@ app.get('/contacts/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// ── Contact photo by phone/email ─────────────────────────────────
+// ── Contact photos ───────────────────────────────────────────────
 
-app.get('/contacts/photo', async (req, res) => {
-  try {
-    const address = req.query.address
-    if (!address) return res.status(400).json({ error: 'address required' })
+// Map: last 7 digits → /tmp/mc-avatar-XXXXXXX.jpg
+const photoMap = new Map()
+let photosReady = false
 
-    const safe = address.replace(/[^a-zA-Z0-9@.+\- ]/g, '')
-    const digits = safe.replace(/\D/g, '')
-    const last10 = digits.length >= 10 ? digits.slice(-10) : digits
+async function buildPhotoCache() {
+  // Swift tool that exports ALL contact photos to /tmp, prints JSON mapping
+  const swiftSrc = `
+import Contacts
+import Foundation
 
-    // Try to find contact photo via AppleScript
-    const tmpFile = `/tmp/mc-avatar-${last10 || safe.replace(/[^a-z0-9]/gi, '')}.tiff`
-    const script = `
-      tell application "Contacts"
-        set matchList to {}
-        repeat with p in every person
-          repeat with ph in phones of p
-            set phDigits to do shell script "echo " & quoted form of (value of ph) & " | tr -cd '0-9'"
-            if phDigits ends with "${last10}" then
-              set end of matchList to p
-              exit repeat
-            end if
-          end repeat
-        end repeat
-        if (count of matchList) > 0 then
-          set thePerson to item 1 of matchList
-          try
-            set theImage to image of thePerson
-            if theImage is not missing value then
-              set fRef to open for access POSIX file "${tmpFile}" with write permission
-              set eof fRef to 0
-              write theImage to fRef
-              close access fRef
-              return "ok"
-            end if
-          end try
-        end if
-        return "no_photo"
-      end tell
-    `
-    const result = await osascript(script)
-    if (result === 'no_photo') {
-      return res.status(404).json({ error: 'no_photo' })
+let store = CNContactStore()
+let keys: [CNKeyDescriptor] = [
+    CNContactPhoneNumbersKey as CNKeyDescriptor,
+    CNContactThumbnailImageDataKey as CNKeyDescriptor
+]
+let request = CNContactFetchRequest(keysToFetch: keys)
+var mapping: [[String: String]] = []
+
+try store.enumerateContacts(with: request) { contact, _ in
+    guard let data = contact.thumbnailImageData else { return }
+    for phone in contact.phoneNumbers {
+        var num = phone.value.stringValue
+        num = num.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+        guard num.count >= 7 else { continue }
+        let last7 = String(num.suffix(7))
+        let path = "/tmp/mc-avatar-\\(last7).jpg"
+        try? data.write(to: URL(fileURLWithPath: path))
+        mapping.append(["key": last7, "path": path])
     }
-    res.sendFile(tmpFile)
+}
+
+let jsonData = try! JSONSerialization.data(withJSONObject: mapping)
+print(String(data: jsonData, encoding: .utf8)!)
+`
+  try {
+    const { writeFile } = await import('fs/promises')
+    await writeFile('/tmp/mc-photo-export.swift', swiftSrc)
+    await execP('swiftc -O /tmp/mc-photo-export.swift -o /tmp/mc-photo-export', { timeout: 60000 })
+    const { stdout } = await execP('/tmp/mc-photo-export', { timeout: 30000 })
+    const entries = JSON.parse(stdout)
+    for (const { key, path } of entries) {
+      photoMap.set(key, path)
+    }
+    photosReady = true
+    console.log(`Photo cache built: ${photoMap.size} contact photos`)
   } catch (err) {
-    res.status(404).json({ error: err.message })
+    console.warn('Photo cache build failed:', err.message)
+    photosReady = true // mark ready even on failure so requests don't hang
   }
+}
+
+// Start building cache in background on startup
+buildPhotoCache()
+
+app.get('/contacts/photo', (req, res) => {
+  const address = req.query.address
+  if (!address) return res.status(400).json({ error: 'address required' })
+
+  const digits = String(address).replace(/\D/g, '')
+  const last7 = digits.length >= 7 ? digits.slice(-7) : digits
+  if (!last7) return res.status(404).json({ error: 'invalid address' })
+
+  const photoPath = photoMap.get(last7)
+  if (photoPath) {
+    return res.sendFile(photoPath)
+  }
+  res.status(404).json({ error: 'no_photo' })
 })
 
 // ═══════════════════════════════════════════════════════════════════
