@@ -224,7 +224,7 @@ app.get('/contacts', async (req, res) => {
 const photoMap = new Map()
 
 async function buildPhotoCache() {
-  // Use AppleScript to export all contact photos to /tmp
+  // Use AppleScript to export all contact photos to /tmp as TIFF, then convert to JPEG
   const script = `
     tell application "Contacts"
       set output to ""
@@ -238,12 +238,14 @@ async function buildPhotoCache() {
               set digits to do shell script "echo " & quoted form of rawNum & " | tr -cd '0-9'"
               if length of digits >= 7 then
                 set last7 to text ((length of digits) - 6) thru (length of digits) of digits
-                set filePath to "/tmp/mc-avatar-" & last7 & ".tiff"
+                set tiffPath to "/tmp/mc-avatar-" & last7 & ".tiff"
                 try
-                  set fRef to open for access POSIX file filePath with write permission
+                  set fRef to open for access POSIX file tiffPath with write permission
                   set eof fRef to 0
                   write img to fRef
                   close access fRef
+                  -- Convert TIFF to JPEG using sips
+                  do shell script "sips -s format jpeg " & quoted form of tiffPath & " --out /tmp/mc-avatar-" & last7 & ".jpg > /dev/null 2>&1 && rm -f " & quoted form of tiffPath
                   set output to output & last7 & linefeed
                 end try
               end if
@@ -258,7 +260,7 @@ async function buildPhotoCache() {
     const result = await osascript(script)
     const keys = result.split('\n').filter(k => k.length === 7)
     for (const key of keys) {
-      photoMap.set(key, `/tmp/mc-avatar-${key}.tiff`)
+      photoMap.set(key, `/tmp/mc-avatar-${key}.jpg`)
     }
     console.log(`Photo cache built: ${photoMap.size} contact photos`)
   } catch (err) {
