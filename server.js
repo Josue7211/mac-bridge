@@ -220,56 +220,53 @@ app.get('/contacts', async (req, res) => {
 
 // ── Contact photos (must be before /contacts/:id) ────────────────
 
-// Map: last 7 digits → /tmp/mc-avatar-XXXXXXX.jpg
+// Map: last 7 digits → /tmp/mc-avatar-XXXXXXX.tiff
 const photoMap = new Map()
-let photosReady = false
 
 async function buildPhotoCache() {
-  const swiftSrc = `
-import Contacts
-import Foundation
-
-let store = CNContactStore()
-let keys: [CNKeyDescriptor] = [
-    CNContactPhoneNumbersKey as CNKeyDescriptor,
-    CNContactThumbnailImageDataKey as CNKeyDescriptor
-]
-let request = CNContactFetchRequest(keysToFetch: keys)
-var mapping: [[String: String]] = []
-
-try store.enumerateContacts(with: request) { contact, _ in
-    guard let data = contact.thumbnailImageData else { return }
-    for phone in contact.phoneNumbers {
-        var num = phone.value.stringValue
-        num = num.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
-        guard num.count >= 7 else { continue }
-        let last7 = String(num.suffix(7))
-        let path = "/tmp/mc-avatar-\\(last7).jpg"
-        try? data.write(to: URL(fileURLWithPath: path))
-        mapping.append(["key": last7, "path": path])
-    }
-}
-
-let jsonData = try! JSONSerialization.data(withJSONObject: mapping)
-print(String(data: jsonData, encoding: .utf8)!)
-`
+  // Use AppleScript to export all contact photos to /tmp
+  const script = `
+    tell application "Contacts"
+      set output to ""
+      repeat with p in every person
+        try
+          set img to image of p
+          if img is not missing value then
+            set phoneList to value of every phone of p
+            repeat with ph in phoneList
+              set rawNum to ph as text
+              set digits to do shell script "echo " & quoted form of rawNum & " | tr -cd '0-9'"
+              if length of digits >= 7 then
+                set last7 to text ((length of digits) - 6) thru (length of digits) of digits
+                set filePath to "/tmp/mc-avatar-" & last7 & ".tiff"
+                try
+                  set fRef to open for access POSIX file filePath with write permission
+                  set eof fRef to 0
+                  write img to fRef
+                  close access fRef
+                  set output to output & last7 & linefeed
+                end try
+              end if
+            end repeat
+          end if
+        end try
+      end repeat
+      return output
+    end tell
+  `
   try {
-    const { writeFile } = await import('fs/promises')
-    await writeFile('/tmp/mc-photo-export.swift', swiftSrc)
-    await execP('swiftc -O /tmp/mc-photo-export.swift -o /tmp/mc-photo-export', { timeout: 60000 })
-    const { stdout } = await execP('/tmp/mc-photo-export', { timeout: 30000 })
-    const entries = JSON.parse(stdout)
-    for (const { key, path } of entries) {
-      photoMap.set(key, path)
+    const result = await osascript(script)
+    const keys = result.split('\n').filter(k => k.length === 7)
+    for (const key of keys) {
+      photoMap.set(key, `/tmp/mc-avatar-${key}.tiff`)
     }
-    photosReady = true
     console.log(`Photo cache built: ${photoMap.size} contact photos`)
   } catch (err) {
     console.warn('Photo cache build failed:', err.message)
-    photosReady = true
   }
 }
 
+// Build in background on startup (can take 30-60s with many contacts)
 buildPhotoCache()
 
 app.get('/contacts/photo', (req, res) => {
