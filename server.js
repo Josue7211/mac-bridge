@@ -40,15 +40,11 @@ async function jxa(script) {
   return JSON.parse(stdout)
 }
 
-async function sqlite(db, query) {
-  const { stdout } = await execFileP('sqlite3', ['-json', db, query], { timeout: 10000 })
-  return stdout.trim() ? JSON.parse(stdout) : []
-}
 
 // ── Health ──────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, services: ['reminders', 'notes', 'contacts', 'messages', 'findmy'] })
+  res.json({ ok: true, services: ['reminders', 'notes', 'contacts', 'findmy'] })
 })
 
 // ═══════════════════════════════════════════════════════════════════
@@ -241,98 +237,6 @@ app.get('/contacts/:id', async (req, res) => {
       })
     `
     res.json(await jxa(script))
-  } catch (err) { res.status(500).json({ error: err.message }) }
-})
-
-// ═══════════════════════════════════════════════════════════════════
-// MESSAGES (iMessage / SMS)
-// ═══════════════════════════════════════════════════════════════════
-
-const CHAT_DB = join(HOME, 'Library/Messages/chat.db')
-
-// Apple's epoch: 2001-01-01 = 978307200 Unix. Dates in nanoseconds.
-const DATE_CONV = 'datetime(message.date/1000000000 + 978307200, "unixepoch", "localtime")'
-
-app.get('/messages/conversations', async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 30
-    const rows = await sqlite(CHAT_DB, `
-      SELECT
-        chat.ROWID as id,
-        chat.chat_identifier as chatId,
-        chat.display_name as displayName,
-        chat.service_name as service,
-        (SELECT text FROM message
-         JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
-         WHERE chat_message_join.chat_id = chat.ROWID
-         ORDER BY message.date DESC LIMIT 1) as lastMessage,
-        (SELECT ${DATE_CONV} FROM message
-         JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
-         WHERE chat_message_join.chat_id = chat.ROWID
-         ORDER BY message.date DESC LIMIT 1) as lastDate,
-        (SELECT is_from_me FROM message
-         JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
-         WHERE chat_message_join.chat_id = chat.ROWID
-         ORDER BY message.date DESC LIMIT 1) as lastFromMe
-      FROM chat
-      WHERE lastMessage IS NOT NULL
-      ORDER BY lastDate DESC
-      LIMIT ${limit}
-    `)
-    res.json(rows)
-  } catch (err) { res.status(500).json({ error: err.message }) }
-})
-
-app.get('/messages/conversations/:id', async (req, res) => {
-  try {
-    const chatId = parseInt(req.params.id)
-    const limit = parseInt(req.query.limit) || 50
-    const before = req.query.before || ''
-
-    let dateFilter = ''
-    if (before) {
-      dateFilter = `AND ${DATE_CONV} < '${before}'`
-    }
-
-    const rows = await sqlite(CHAT_DB, `
-      SELECT
-        message.ROWID as id,
-        message.guid,
-        message.text,
-        ${DATE_CONV} as date,
-        message.is_from_me as isFromMe,
-        message.cache_has_attachments as hasAttachments,
-        message.associated_message_type as reactionType,
-        handle.id as sender,
-        message.service as service
-      FROM message
-      JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
-      LEFT JOIN handle ON message.handle_id = handle.ROWID
-      WHERE chat_message_join.chat_id = ${chatId}
-        AND message.text IS NOT NULL
-        AND message.associated_message_type = 0
-        ${dateFilter}
-      ORDER BY message.date DESC
-      LIMIT ${limit}
-    `)
-    res.json(rows.reverse())
-  } catch (err) { res.status(500).json({ error: err.message }) }
-})
-
-app.post('/messages/send', async (req, res) => {
-  try {
-    const { to, text } = req.body
-    if (!to || !text) return res.status(400).json({ error: 'to and text required' })
-    const safeTo = to.replace(/"/g, '\\"')
-    const safeText = text.replace(/"/g, '\\"')
-    await osascript(
-      `tell application "Messages"
-        set targetService to 1st account whose service type = iMessage
-        set targetBuddy to participant "${safeTo}" of targetService
-        send "${safeText}" to targetBuddy
-      end tell`
-    )
-    res.json({ ok: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
