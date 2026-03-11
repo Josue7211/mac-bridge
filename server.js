@@ -2,7 +2,7 @@ import express from 'express'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { homedir } from 'os'
-import { join } from 'path'
+import { join, resolve, extname } from 'path'
 
 const execFileP = promisify(execFile)
 const app = express()
@@ -401,6 +401,67 @@ app.post('/messages/mark-read', async (req, res) => {
   } catch (err) {
     console.error('mark-read error:', err.message)
     res.status(500).json({ error: err.message })
+  }
+})
+
+// ── Messages — serve raw attachment file by BB GUID (for HEIC/HEICS conversion) ──
+
+app.get('/messages/attachment-raw', async (req, res) => {
+  const guid = req.query.guid
+  const originalName = req.query.name // original filename without .jpeg suffix
+  if (!guid || typeof guid !== 'string') {
+    return res.status(400).json({ error: 'guid required' })
+  }
+  // Validate guid format (e.g. at_0_UUID or at_UUID_UUID)
+  if (!/^at_[a-zA-Z0-9_\-]+$/.test(guid)) {
+    return res.status(400).json({ error: 'invalid guid' })
+  }
+
+  const attachDir = join(HOME, 'Library/Messages/Attachments')
+  try {
+    const { execFile: execFileCb } = await import('child_process')
+    const { promisify: prom } = await import('util')
+    const execAsync = prom(execFileCb)
+
+    // Find the attachment directory by GUID
+    const { stdout } = await execAsync('find', [attachDir, '-type', 'd', '-name', guid, '-maxdepth', '4'], { timeout: 5000 })
+    const dirs = stdout.trim().split('\n').filter(Boolean)
+    if (dirs.length === 0) return res.status(404).json({ error: 'attachment not found' })
+
+    // List files in the directory, prefer original format over converted
+    const { readdir, readFile } = await import('fs/promises')
+    const files = await readdir(dirs[0])
+
+    // If originalName provided (e.g. "foo.heics"), look for it first
+    let target = null
+    if (originalName && files.includes(originalName)) {
+      target = originalName
+    }
+    // Otherwise find the first non-jpeg file (original format)
+    if (!target) {
+      target = files.find(f => /\.(heics|heic|apng|webp|gif|png)$/i.test(f)) || files[0]
+    }
+    if (!target) return res.status(404).json({ error: 'no file in attachment dir' })
+
+    const fullPath = join(dirs[0], target)
+    // Security: verify still under Attachments
+    const resolved2 = resolve(fullPath)
+    if (!resolved2.startsWith(attachDir + '/')) {
+      return res.status(403).json({ error: 'path not allowed' })
+    }
+
+    const data = await readFile(resolved2)
+    const ext2 = extname(target).toLowerCase()
+    const types = {
+      '.heic': 'image/heic', '.heics': 'image/heic-sequence',
+      '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+      '.gif': 'image/gif', '.webp': 'image/webp', '.apng': 'image/apng',
+      '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.caf': 'audio/x-caf',
+    }
+    res.set('Content-Type', types[ext2] || 'application/octet-stream')
+    res.send(data)
+  } catch {
+    res.status(404).json({ error: 'attachment not found' })
   }
 })
 
