@@ -423,35 +423,41 @@ app.get('/messages/attachment-raw', async (req, res) => {
     const { promisify: prom } = await import('util')
     const execAsync = prom(execFileCb)
 
-    // Find the attachment directory by GUID
-    const { stdout } = await execAsync('find', [attachDir, '-type', 'd', '-name', guid, '-maxdepth', '4'], { timeout: 5000 })
+    // Try to find the attachment file. macOS stores them at:
+    // ~/Library/Messages/Attachments/XX/YY/<dir>/<filename>
+    // The directory name may match the BB GUID or just be a UUID.
+
+    // Strategy 1: search for directory matching BB GUID
+    let foundFile = null
+    const { stdout } = await execAsync('find', [attachDir, '-type', 'd', '-name', guid, '-maxdepth', '4'], { timeout: 5000 }).catch(() => ({ stdout: '' }))
     const dirs = stdout.trim().split('\n').filter(Boolean)
-    if (dirs.length === 0) return res.status(404).json({ error: 'attachment not found' })
 
-    // List files in the directory, prefer original format over converted
-    const { readdir, readFile } = await import('fs/promises')
-    const files = await readdir(dirs[0])
-
-    // If originalName provided (e.g. "foo.heics"), look for it first
-    let target = null
-    if (originalName && files.includes(originalName)) {
-      target = originalName
+    if (dirs.length > 0) {
+      const { readdir } = await import('fs/promises')
+      const files = await readdir(dirs[0])
+      const target = (originalName && files.includes(originalName)) ? originalName
+        : files.find(f => /\.(heics|heic|apng|webp|gif|png)$/i.test(f)) || files[0]
+      if (target) foundFile = join(dirs[0], target)
     }
-    // Otherwise find the first non-jpeg file (original format)
-    if (!target) {
-      target = files.find(f => /\.(heics|heic|apng|webp|gif|png)$/i.test(f)) || files[0]
-    }
-    if (!target) return res.status(404).json({ error: 'no file in attachment dir' })
 
-    const fullPath = join(dirs[0], target)
+    // Strategy 2: search by original filename directly
+    if (!foundFile && originalName) {
+      const { stdout: stdout2 } = await execAsync('find', [attachDir, '-type', 'f', '-name', originalName, '-maxdepth', '5'], { timeout: 5000 }).catch(() => ({ stdout: '' }))
+      const files2 = stdout2.trim().split('\n').filter(Boolean)
+      if (files2.length > 0) foundFile = files2[0]
+    }
+
+    if (!foundFile) return res.status(404).json({ error: 'attachment not found' })
+
     // Security: verify still under Attachments
-    const resolved2 = resolve(fullPath)
+    const resolved2 = resolve(foundFile)
     if (!resolved2.startsWith(attachDir + '/')) {
       return res.status(403).json({ error: 'path not allowed' })
     }
 
+    const { readFile } = await import('fs/promises')
     const data = await readFile(resolved2)
-    const ext2 = extname(target).toLowerCase()
+    const ext2 = extname(foundFile).toLowerCase()
     const types = {
       '.heic': 'image/heic', '.heics': 'image/heic-sequence',
       '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
