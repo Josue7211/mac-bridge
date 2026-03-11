@@ -1,13 +1,17 @@
 import express from 'express'
-import { execFile } from 'child_process'
+import { execFile, exec as execCb } from 'child_process'
 import { promisify } from 'util'
+import { homedir } from 'os'
+import { join } from 'path'
 
-const exec = promisify(execFile)
+const execFileP = promisify(execFile)
+const execP = promisify(execCb)
 const app = express()
 app.use(express.json())
 
 const PORT = process.env.BRIDGE_PORT || 4100
 const API_KEY = process.env.BRIDGE_API_KEY || ''
+const HOME = homedir()
 
 // ── Auth middleware ─────────────────────────────────────────────────
 
@@ -19,55 +23,55 @@ if (API_KEY) {
   })
 }
 
-// ── Health check ────────────────────────────────────────────────────
-
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, services: ['reminders'] })
-})
-
-// ── Reminders ───────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────
 
 async function remindctl(...args) {
-  try {
-    const { stdout } = await exec('remindctl', [...args, '--json'], { timeout: 10000 })
-    return JSON.parse(stdout)
-  } catch (err) {
-    throw new Error(err.stderr || err.message)
-  }
+  const { stdout } = await execFileP('remindctl', [...args, '--json'], { timeout: 10000 })
+  return JSON.parse(stdout)
 }
 
-// List reminders (all, today, tomorrow, week, overdue, or specific date)
+async function osascript(script) {
+  const { stdout } = await execP(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: 15000 })
+  return stdout.trim()
+}
+
+async function jxa(script) {
+  const { stdout } = await execP(`osascript -l JavaScript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: 15000 })
+  return JSON.parse(stdout)
+}
+
+async function sqlite(db, query) {
+  const { stdout } = await execFileP('sqlite3', ['-json', db, query], { timeout: 10000 })
+  return stdout.trim() ? JSON.parse(stdout) : []
+}
+
+// ── Health ──────────────────────────────────────────────────────────
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, services: ['reminders', 'notes', 'contacts', 'messages', 'findmy'] })
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// REMINDERS
+// ═══════════════════════════════════════════════════════════════════
+
 app.get('/reminders', async (req, res) => {
   try {
-    const filter = req.query.filter || 'all' // all, today, tomorrow, week, overdue, YYYY-MM-DD
-    const data = await remindctl(filter)
-    res.json(data)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    const filter = req.query.filter || 'all'
+    res.json(await remindctl(filter))
+  } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// List reminder lists
 app.get('/reminders/lists', async (_req, res) => {
-  try {
-    const data = await remindctl('list')
-    res.json(data)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+  try { res.json(await remindctl('list')) }
+  catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// Get reminders from a specific list
 app.get('/reminders/lists/:name', async (req, res) => {
-  try {
-    const data = await remindctl('list', req.params.name)
-    res.json(data)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+  try { res.json(await remindctl('list', req.params.name)) }
+  catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// Create a reminder
 app.post('/reminders', async (req, res) => {
   try {
     const { title, list, due } = req.body
@@ -75,32 +79,312 @@ app.post('/reminders', async (req, res) => {
     const args = ['add', title]
     if (list) args.push('--list', list)
     if (due) args.push('--due', due)
-    const data = await remindctl(...args)
-    res.json(data)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    res.json(await remindctl(...args))
+  } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// Complete reminder(s)
 app.post('/reminders/complete', async (req, res) => {
   try {
     const { ids } = req.body
     if (!ids?.length) return res.status(400).json({ error: 'ids required' })
-    const data = await remindctl('complete', ...ids)
-    res.json(data)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    res.json(await remindctl('complete', ...ids))
+  } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// Delete a reminder
 app.delete('/reminders/:id', async (req, res) => {
+  try { res.json(await remindctl('delete', req.params.id, '--force')) }
+  catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// NOTES
+// ═══════════════════════════════════════════════════════════════════
+
+app.get('/notes', async (req, res) => {
   try {
-    const data = await remindctl('delete', req.params.id, '--force')
-    res.json(data)
+    const limit = parseInt(req.query.limit) || 50
+    const folder = req.query.folder || ''
+    const search = req.query.search || ''
+
+    let script
+    if (search) {
+      script = `
+        const Notes = Application("Notes");
+        const results = Notes.notes.whose({name: {_contains: "${search.replace(/"/g, '\\"')}"}})();
+        JSON.stringify(results.slice(0, ${limit}).map(n => ({
+          id: n.id(), name: n.name(), body: n.plaintext().substring(0, 200),
+          folder: n.container().name(), created: n.creationDate().toISOString(),
+          modified: n.modificationDate().toISOString()
+        })))
+      `
+    } else if (folder) {
+      script = `
+        const Notes = Application("Notes");
+        const f = Notes.folders.byName("${folder.replace(/"/g, '\\"')}");
+        const notes = f.notes();
+        JSON.stringify(notes.slice(0, ${limit}).map(n => ({
+          id: n.id(), name: n.name(), body: n.plaintext().substring(0, 200),
+          folder: "${folder}", created: n.creationDate().toISOString(),
+          modified: n.modificationDate().toISOString()
+        })))
+      `
+    } else {
+      script = `
+        const Notes = Application("Notes");
+        const notes = Notes.notes();
+        JSON.stringify(notes.slice(0, ${limit}).map(n => ({
+          id: n.id(), name: n.name(), body: n.plaintext().substring(0, 200),
+          folder: n.container().name(), created: n.creationDate().toISOString(),
+          modified: n.modificationDate().toISOString()
+        })))
+      `
+    }
+    res.json(await jxa(script))
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.get('/notes/folders', async (_req, res) => {
+  try {
+    const script = `
+      const Notes = Application("Notes");
+      JSON.stringify(Notes.folders().map(f => ({ name: f.name(), count: f.notes().length })))
+    `
+    res.json(await jxa(script))
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.get('/notes/:id', async (req, res) => {
+  try {
+    const id = req.params.id.replace(/"/g, '\\"')
+    const script = `
+      const Notes = Application("Notes");
+      const n = Notes.notes.byId("${id}");
+      JSON.stringify({
+        id: n.id(), name: n.name(), body: n.plaintext(),
+        html: n.body(), folder: n.container().name(),
+        created: n.creationDate().toISOString(),
+        modified: n.modificationDate().toISOString()
+      })
+    `
+    res.json(await jxa(script))
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.post('/notes', async (req, res) => {
+  try {
+    const { title, body, folder } = req.body
+    if (!title) return res.status(400).json({ error: 'title required' })
+    const safeTitle = title.replace(/"/g, '\\"')
+    const safeBody = (body || '').replace(/"/g, '\\"')
+    const target = folder
+      ? `folder "${folder.replace(/"/g, '\\"')}" of application "Notes"`
+      : 'default account of application "Notes"'
+    await osascript(`tell application "Notes" to make new note at ${target} with properties {name:"${safeTitle}", body:"${safeBody}"}`)
+    res.json({ ok: true })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// CONTACTS
+// ═══════════════════════════════════════════════════════════════════
+
+app.get('/contacts', async (req, res) => {
+  try {
+    const search = req.query.search || ''
+    const limit = parseInt(req.query.limit) || 30
+    let script
+    if (search) {
+      const safe = search.replace(/"/g, '\\"')
+      script = `
+        const Contacts = Application("Contacts");
+        const people = Contacts.people.whose({_or: [
+          {firstName: {_contains: "${safe}"}},
+          {lastName: {_contains: "${safe}"}}
+        ]})();
+        JSON.stringify(people.slice(0, ${limit}).map(p => ({
+          id: p.id(), name: p.name(),
+          phones: p.phones().map(ph => ({label: ph.label(), value: ph.value()})),
+          emails: p.emails().map(e => ({label: e.label(), value: e.value()}))
+        })))
+      `
+    } else {
+      script = `
+        const Contacts = Application("Contacts");
+        const people = Contacts.people();
+        JSON.stringify(people.slice(0, ${limit}).map(p => ({
+          id: p.id(), name: p.name(),
+          phones: p.phones().map(ph => ({label: ph.label(), value: ph.value()})),
+          emails: p.emails().map(e => ({label: e.label(), value: e.value()}))
+        })))
+      `
+    }
+    res.json(await jxa(script))
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.get('/contacts/:id', async (req, res) => {
+  try {
+    const id = req.params.id.replace(/"/g, '\\"')
+    const script = `
+      const Contacts = Application("Contacts");
+      const p = Contacts.people.byId("${id}");
+      JSON.stringify({
+        id: p.id(), name: p.name(),
+        firstName: p.firstName(), lastName: p.lastName(),
+        organization: p.organization(),
+        phones: p.phones().map(ph => ({label: ph.label(), value: ph.value()})),
+        emails: p.emails().map(e => ({label: e.label(), value: e.value()})),
+        addresses: p.addresses().map(a => ({
+          label: a.label(), street: a.street(), city: a.city(),
+          state: a.state(), zip: a.zip(), country: a.country()
+        }))
+      })
+    `
+    res.json(await jxa(script))
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// MESSAGES (iMessage / SMS)
+// ═══════════════════════════════════════════════════════════════════
+
+const CHAT_DB = join(HOME, 'Library/Messages/chat.db')
+
+// Apple's epoch: 2001-01-01 = 978307200 Unix. Dates in nanoseconds.
+const DATE_CONV = 'datetime(message.date/1000000000 + 978307200, "unixepoch", "localtime")'
+
+app.get('/messages/conversations', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 30
+    const rows = await sqlite(CHAT_DB, `
+      SELECT
+        chat.ROWID as id,
+        chat.chat_identifier as chatId,
+        chat.display_name as displayName,
+        chat.service_name as service,
+        (SELECT text FROM message
+         JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
+         WHERE chat_message_join.chat_id = chat.ROWID
+         ORDER BY message.date DESC LIMIT 1) as lastMessage,
+        (SELECT ${DATE_CONV} FROM message
+         JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
+         WHERE chat_message_join.chat_id = chat.ROWID
+         ORDER BY message.date DESC LIMIT 1) as lastDate,
+        (SELECT is_from_me FROM message
+         JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
+         WHERE chat_message_join.chat_id = chat.ROWID
+         ORDER BY message.date DESC LIMIT 1) as lastFromMe
+      FROM chat
+      WHERE lastMessage IS NOT NULL
+      ORDER BY lastDate DESC
+      LIMIT ${limit}
+    `)
+    res.json(rows)
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.get('/messages/conversations/:id', async (req, res) => {
+  try {
+    const chatId = parseInt(req.params.id)
+    const limit = parseInt(req.query.limit) || 50
+    const before = req.query.before || ''
+
+    let dateFilter = ''
+    if (before) {
+      dateFilter = `AND ${DATE_CONV} < '${before}'`
+    }
+
+    const rows = await sqlite(CHAT_DB, `
+      SELECT
+        message.ROWID as id,
+        message.guid,
+        message.text,
+        ${DATE_CONV} as date,
+        message.is_from_me as isFromMe,
+        message.cache_has_attachments as hasAttachments,
+        message.associated_message_type as reactionType,
+        handle.id as sender,
+        message.service as service
+      FROM message
+      JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
+      LEFT JOIN handle ON message.handle_id = handle.ROWID
+      WHERE chat_message_join.chat_id = ${chatId}
+        AND message.text IS NOT NULL
+        AND message.associated_message_type = 0
+        ${dateFilter}
+      ORDER BY message.date DESC
+      LIMIT ${limit}
+    `)
+    res.json(rows.reverse())
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.post('/messages/send', async (req, res) => {
+  try {
+    const { to, text } = req.body
+    if (!to || !text) return res.status(400).json({ error: 'to and text required' })
+    const safeTo = to.replace(/"/g, '\\"')
+    const safeText = text.replace(/"/g, '\\"')
+    await osascript(
+      `tell application "Messages"
+        set targetService to 1st account whose service type = iMessage
+        set targetBuddy to participant "${safeTo}" of targetService
+        send "${safeText}" to targetBuddy
+      end tell`
+    )
+    res.json({ ok: true })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// FIND MY
+// ═══════════════════════════════════════════════════════════════════
+
+app.get('/findmy/devices', async (_req, res) => {
+  try {
+    // Read from Find My cache (requires Find My app to be running/synced)
+    const cachePath = join(HOME, 'Library/Caches/com.apple.findmy.fmipcore/Items.data')
+    const { readFile } = await import('fs/promises')
+    const raw = await readFile(cachePath, 'utf-8')
+    const items = JSON.parse(raw)
+    const devices = items.map(d => ({
+      id: d.identifier || d.serialNumber,
+      name: d.name,
+      model: d.productType?.type,
+      battery: d.batteryLevel,
+      batteryStatus: d.batteryStatus,
+      location: d.location ? {
+        lat: d.location.latitude,
+        lng: d.location.longitude,
+        accuracy: d.location.horizontalAccuracy,
+        timestamp: d.location.timeStamp,
+      } : null,
+    }))
+    res.json(devices)
   } catch (err) {
-    res.status(500).json({ error: err.message })
+    // Fallback: try Devices.data
+    try {
+      const cachePath = join(HOME, 'Library/Caches/com.apple.findmy.fmipcore/Devices.data')
+      const { readFile } = await import('fs/promises')
+      const raw = await readFile(cachePath, 'utf-8')
+      const items = JSON.parse(raw)
+      const devices = items.map(d => ({
+        id: d.baUUID || d.deviceDiscoveryId,
+        name: d.name,
+        model: d.deviceDisplayName,
+        battery: d.batteryLevel,
+        batteryStatus: d.batteryStatus,
+        location: d.location ? {
+          lat: d.location.latitude,
+          lng: d.location.longitude,
+          accuracy: d.location.horizontalAccuracy,
+          timestamp: d.location.timeStamp,
+        } : null,
+      }))
+      res.json(devices)
+    } catch (err2) {
+      res.status(500).json({ error: 'Find My cache not available. Open Find My app on this Mac first. ' + err2.message })
+    }
   }
 })
 
@@ -108,5 +392,6 @@ app.delete('/reminders/:id', async (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`mac-bridge listening on 0.0.0.0:${PORT}`)
-  if (!API_KEY) console.warn('⚠ No BRIDGE_API_KEY set — running without auth')
+  console.log('Services: reminders, notes, contacts, messages, findmy')
+  if (!API_KEY) console.warn('Warning: No BRIDGE_API_KEY set — running without auth')
 })
