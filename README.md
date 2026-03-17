@@ -53,11 +53,39 @@ BRIDGE_API_KEY=your-secret-key-here
 - **Find My** app must be open/synced for device location
 - **Full Disk Access** granted to your terminal (for Messages chat.db access)
 
-### Run
+### Run as a persistent service (recommended)
+
+The bridge should run permanently on your Mac. Use the included install script to set it up as a **launchd** service that starts on boot and restarts on failure:
 
 ```bash
-npm start        # production
-npm run dev      # development (auto-restart on changes)
+./install.sh
+```
+
+This creates a launchd plist at `~/Library/LaunchAgents/com.mac-bridge.plist` that:
+- Starts automatically on login
+- Restarts if the process crashes
+- Logs to `/tmp/mac-bridge.log`
+
+#### Manual control
+
+```bash
+# Stop the service
+launchctl unload ~/Library/LaunchAgents/com.mac-bridge.plist
+
+# Start the service
+launchctl load ~/Library/LaunchAgents/com.mac-bridge.plist
+
+# Check status
+launchctl list | grep mac-bridge
+
+# View logs
+tail -f /tmp/mac-bridge.log
+```
+
+#### Run manually (development only)
+
+```bash
+npm run dev      # auto-restart on file changes
 ```
 
 ### Connecting to Mission Control
