@@ -456,10 +456,25 @@ app.get('/messages/attachment-raw', async (req, res) => {
     }
 
     const { readFile } = await import('fs/promises')
-    const data = await readFile(resolved2)
     const ext2 = extname(foundFile).toLowerCase()
+
+    // HEIC/HEICS: convert to PNG using macOS sips (preserves alpha/transparency)
+    if (ext2 === '.heic' || ext2 === '.heics') {
+      const tmpPng = `/tmp/mc-sticker-${guid}.png`
+      try {
+        await execAsync('sips', ['-s', 'format', 'png', resolved2, '--out', tmpPng], { timeout: 10000 })
+        const pngData = await readFile(tmpPng)
+        // Clean up temp file
+        import('fs/promises').then(fs => fs.unlink(tmpPng).catch(() => {}))
+        res.set('Content-Type', 'image/png')
+        return res.send(pngData)
+      } catch {
+        // sips failed, fall through to raw file
+      }
+    }
+
+    const data = await readFile(resolved2)
     const types = {
-      '.heic': 'image/heic', '.heics': 'image/heic-sequence',
       '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
       '.gif': 'image/gif', '.webp': 'image/webp', '.apng': 'image/apng',
       '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.caf': 'audio/x-caf',
