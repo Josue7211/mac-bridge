@@ -30,77 +30,133 @@ Mission Control is a cross-platform desktop app (Linux, macOS, Windows) that int
 
 ## Setup
 
+### 1. Prerequisites
+
+- **macOS** (uses AppleScript, JXA, `sips`, and macOS-specific file paths)
+- **Node.js 18+** — install via [Homebrew](https://brew.sh): `brew install node`
+- **[Tailscale](https://tailscale.com)** — for secure remote access from your desktop
+- **[remindctl](https://github.com/keith/reminders-cli)** — for Reminders support: `brew install keith/formulae/reminders-cli`
+
+#### macOS permissions
+
+The bridge needs access to your data. Go to **System Settings → Privacy & Security** and grant your terminal (or the node process) access to:
+
+| Permission | Required for |
+|---|---|
+| **Full Disk Access** | Messages (chat.db), attachments |
+| **Contacts** | Contact search and photos |
+| **Reminders** | Apple Reminders via remindctl |
+
+> macOS will prompt you the first time each service is accessed. Click "Allow" when asked.
+
+Find My requires the **Find My** app to be open (or recently synced) — the bridge reads its local cache.
+
+### 2. Clone and install
+
 ```bash
 git clone https://github.com/Josue7211/mac-bridge.git
 cd mac-bridge
 npm install
+```
+
+### 3. Generate an API key
+
+The API key prevents unauthorized access to your Mac's data. Generate a random one:
+
+```bash
+openssl rand -hex 32
+```
+
+Copy the output — you'll need it in two places:
+1. The bridge config (`.env` on your Mac)
+2. Mission Control (Settings → Connections → mac-bridge API key)
+
+### 4. Configure
+
+```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
+Edit `.env` with your generated key:
+
 ```
 BRIDGE_PORT=4100
-BRIDGE_API_KEY=your-secret-key-here
+BRIDGE_API_KEY=paste-your-generated-key-here
 ```
 
-> **Important:** Always set `BRIDGE_API_KEY` in production. Without it, the server runs with no authentication.
+### 5. Test it works
 
-### Prerequisites
+```bash
+npm start
+```
 
-- **macOS** (uses AppleScript, JXA, `sips`, and macOS-specific file paths)
-- **Node.js** 18+
-- **[remindctl](https://github.com/keith/reminders-cli)** for Reminders support
-- **Find My** app must be open/synced for device location
-- **Full Disk Access** granted to your terminal (for Messages chat.db access)
+In another terminal, verify:
 
-### Run as a persistent service (recommended)
+```bash
+curl -H "X-API-Key: YOUR_KEY" http://localhost:4100/health
+# → {"ok":true,"services":["reminders","notes","contacts","findmy"]}
 
-The bridge should run permanently on your Mac. Use the included install script to set it up as a **launchd** service that starts on boot and restarts on failure:
+curl -H "X-API-Key: YOUR_KEY" http://localhost:4100/reminders
+# → your Apple Reminders as JSON
+```
+
+If that works, stop the server (`Ctrl+C`) and install it as a background service.
+
+### 6. Install as a background service
 
 ```bash
 ./install.sh
 ```
 
-This creates a launchd plist at `~/Library/LaunchAgents/com.mac-bridge.plist` that:
-- Starts automatically on login
-- Restarts if the process crashes
+This creates a **launchd** service that:
+- Starts automatically when you log in
+- Restarts automatically if it crashes
+- Runs silently in the background (no terminal window needed)
 - Logs to `/tmp/mac-bridge.log`
 
-#### Manual control
+#### Managing the service
 
 ```bash
-# Stop the service
-launchctl unload ~/Library/LaunchAgents/com.mac-bridge.plist
-
-# Start the service
-launchctl load ~/Library/LaunchAgents/com.mac-bridge.plist
-
-# Check status
+# Check if running
 launchctl list | grep mac-bridge
 
 # View logs
 tail -f /tmp/mac-bridge.log
+
+# Stop
+launchctl unload ~/Library/LaunchAgents/com.mac-bridge.plist
+
+# Start
+launchctl load ~/Library/LaunchAgents/com.mac-bridge.plist
+
+# Reinstall (after changing .env or updating code)
+./install.sh
 ```
 
-#### Run manually (development only)
+### 7. Connect Mission Control
+
+In Mission Control on your desktop, go to **Settings → Connections** and set:
+
+- **mac-bridge URL:** `http://<your-mac-tailscale-ip>:4100`
+- **mac-bridge API key:** the same key you generated in step 3
+
+Find your Mac's Tailscale IP with:
 
 ```bash
-npm run dev      # auto-restart on file changes
-```
-
-### Connecting to Mission Control
-
-In Mission Control, go to **Settings → Connections** and set the mac-bridge URL to your Mac's Tailscale IP:
-
-```
-http://100.x.x.x:4100
+tailscale ip -4    # on your Mac
 ```
 
 ## API
 
-All endpoints return JSON. If `BRIDGE_API_KEY` is set, every request must include:
+All endpoints return JSON. Every request must include the API key:
 - Header: `X-API-Key: <key>`, or
 - Query param: `?api_key=<key>`
+
+### Health
+
+```
+GET    /health                 # → { ok: true, services: [...] }
+```
 
 ### Reminders
 
@@ -145,11 +201,24 @@ GET    /messages/attachment-raw     # serve attachment: ?guid=&name=
 
 ## Security
 
-- **Set `BRIDGE_API_KEY`** — without it, anyone who can reach the server can access your data
-- The server binds to `0.0.0.0` (all interfaces) so it's reachable over Tailscale. If you're on a shared network, consider binding to your Tailscale IP instead, or use firewall rules
-- Messages mark-read validates `chatGuid` format to prevent SQL injection
-- User inputs in JXA/AppleScript are sanitized via `safeJxaString()`
-- Attachment serving is path-restricted to `~/Library/Messages/Attachments/`
+- **Always set `BRIDGE_API_KEY`** — without it, anyone who can reach the server can read your contacts, notes, reminders, and device locations
+- The server binds to `0.0.0.0` (all interfaces) so it's reachable over Tailscale. If your Mac is on a shared/public network, consider binding to your Tailscale IP only, or use a firewall to block port 4100 on non-Tailscale interfaces
+- All user inputs in JXA/AppleScript are sanitized via `safeJxaString()` to prevent injection
+- `chatGuid` is validated against a strict regex before use in SQL
+- Attachment file serving is path-restricted to `~/Library/Messages/Attachments/`
+- The bridge has **no internet access requirements** — it only talks to local macOS services and responds to incoming HTTP requests
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `remindctl: command not found` | `brew install keith/formulae/reminders-cli` |
+| Reminders returns empty | Grant Reminders permission in System Settings → Privacy |
+| Notes/Contacts returns error | Grant permission when macOS prompts, or add manually in Privacy settings |
+| Find My returns "cache not available" | Open the Find My app on your Mac and wait for it to sync |
+| Messages mark-read fails | Grant Full Disk Access to your terminal in System Settings → Privacy |
+| Bridge not reachable from desktop | Check Tailscale is running on both machines: `tailscale status` |
+| Service won't start after install | Check logs: `cat /tmp/mac-bridge.log` and verify `node` path: `which node` |
 
 ## License
 
