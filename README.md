@@ -4,18 +4,7 @@ A lightweight REST bridge that exposes macOS-only services over HTTP — built f
 
 Mission Control is a cross-platform desktop app (Linux, macOS, Windows) that integrates iMessage, AI chat, task management, and more. Since Apple services like Reminders, Notes, Contacts, and Find My only have APIs on macOS, this bridge runs on a Mac and makes them available to Mission Control over the network via [Tailscale](https://tailscale.com).
 
-```
-┌──────────────────────┐         Tailscale          ┌─────────────────┐
-│  Any Desktop         │◄──────────────────────────►│  Mac             │
-│  (Linux/macOS/Win)   │          HTTP               │                 │
-│                      │                             │  mac-bridge      │
-│  Mission Control     │  GET /reminders ──────────► │  ├─ Reminders    │
-│  (Tauri app)         │  GET /notes ──────────────► │  ├─ Notes        │
-│                      │  GET /contacts ───────────► │  ├─ Contacts     │
-│                      │  GET /findmy/devices ─────► │  ├─ Find My      │
-│                      │  POST /messages/mark-read ► │  └─ Messages     │
-└──────────────────────┘                             └─────────────────┘
-```
+![Architecture](docs/architecture.png)
 
 ## Services
 
