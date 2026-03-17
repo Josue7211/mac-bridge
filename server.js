@@ -1,26 +1,48 @@
 import express from 'express'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import { homedir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { join, resolve, extname } from 'path'
-import { createHash, timingSafeEqual } from 'crypto'
+import { createHash, timingSafeEqual, randomBytes } from 'crypto'
+import { mkdirSync, chmodSync, lstatSync } from 'fs'
 
 const execFileP = promisify(execFile)
 const app = express()
+app.disable('x-powered-by') // don't leak server technology
 
 // ── Input limits ────────────────────────────────────────────────────
 const MAX_STRING_LENGTH = 10000
 const MAX_ARRAY_LENGTH = 100
+
+// Private temp directory for mac-bridge (owner-only permissions)
+const BRIDGE_TMP = join(tmpdir(), 'mac-bridge-private')
+try {
+  // Prevent symlink attack: if path exists as symlink, refuse to use it
+  try { if (lstatSync(BRIDGE_TMP).isSymbolicLink()) { throw new Error('BRIDGE_TMP is a symlink') } } catch (e) { if (e.code !== 'ENOENT') throw e }
+  mkdirSync(BRIDGE_TMP, { recursive: true, mode: 0o700 })
+  chmodSync(BRIDGE_TMP, 0o700)
+} catch (e) { console.warn('Failed to create private temp dir:', e.code || e.message) }
 
 // Sanitize user input for safe interpolation into JXA/AppleScript double-quoted strings
 function safeJxaString(s) {
   return String(s)
     .slice(0, MAX_STRING_LENGTH)
     .replace(/\\/g, '\\\\')
+    .replace(/`/g, '\\`')    // prevent JXA template literal breakout
+    .replace(/\$/g, '\\$')   // prevent template expression injection
     .replace(/"/g, '\\"')
     .replace(/\n/g, '\\n')
     .replace(/\r/g, '')
-    .replace(/\0/g, '')     // strip null bytes
+    .replace(/\0/g, '')      // strip null bytes
+}
+
+// Reject strings that look like CLI flags (argument injection prevention)
+function assertNotFlag(s) {
+  s = String(s) // coerce to string to prevent toString() bypass
+  if (s.startsWith('-')) {
+    throw new Error('invalid input: value must not start with -')
+  }
+  return s
 }
 
 app.use(express.json({ limit: '1mb' }))
@@ -36,7 +58,7 @@ if (!API_KEY) {
   process.exit(1)
 }
 
-// Simple in-memory rate limiter
+// Simple in-memory rate limiter with periodic cleanup
 const rateBuckets = new Map()
 function rateLimit(key, maxPerMinute) {
   const now = Date.now()
@@ -46,9 +68,25 @@ function rateLimit(key, maxPerMinute) {
   rateBuckets.set(key, bucket)
   return bucket.count > maxPerMinute
 }
+// Prune expired rate-limit entries every 5 minutes to prevent memory leak
+setInterval(() => {
+  const now = Date.now()
+  for (const [key, bucket] of rateBuckets) {
+    if (now > bucket.resetAt) rateBuckets.delete(key)
+  }
+}, 300000).unref()
+
+// ── Security headers ────────────────────────────────────────────────
+app.use((_req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff')
+  res.set('X-Frame-Options', 'DENY')
+  res.set('Cache-Control', 'no-store')
+  res.set('Content-Security-Policy', "default-src 'none'")
+  next()
+})
 
 app.use((req, res, next) => {
-  const key = req.headers['x-api-key'] || req.query.api_key || ''
+  const key = req.headers['x-api-key'] || ''
   // Constant-time comparison to prevent timing attacks
   if (typeof key !== 'string' || key.length === 0) {
     return res.status(401).json({ error: 'unauthorized' })
@@ -78,13 +116,16 @@ app.use((req, res, next) => {
 // Sanitize error messages to prevent internal detail leakage
 function safeError(err) {
   const msg = String(err?.message || 'unknown error')
-  // Strip file paths and stack traces
-  return msg.replace(/\/Users\/[^\s:]+/g, '<redacted-path>').slice(0, 200)
+  // Strip ALL filesystem paths (not just /Users/) and line:col references
+  return msg
+    .replace(/\/(?:Users|var|tmp|opt|private|Library|usr|etc)\/[^\s:]+/g, '<redacted-path>')
+    .replace(/:\d+:\d+/g, '')  // strip line:column references
+    .slice(0, 200)
 }
 
 async function remindctl(...args) {
   const { stdout } = await execFileP('remindctl', [...args, '--json'], { timeout: 10000 })
-  return JSON.parse(stdout)
+  try { return JSON.parse(stdout) } catch { throw new Error('remindctl returned invalid JSON') }
 }
 
 async function osascript(script) {
@@ -94,7 +135,7 @@ async function osascript(script) {
 
 async function jxa(script) {
   const { stdout } = await execFileP('osascript', ['-l', 'JavaScript', '-e', script], { timeout: 15000 })
-  return JSON.parse(stdout)
+  try { return JSON.parse(stdout) } catch { throw new Error('JXA returned invalid JSON') }
 }
 
 
@@ -110,7 +151,8 @@ app.get('/health', (_req, res) => {
 
 app.get('/reminders', async (req, res) => {
   try {
-    const filter = req.query.filter || 'all'
+    const allowed = ['all', 'incomplete', 'completed', 'today']
+    const filter = allowed.includes(req.query.filter) ? req.query.filter : 'all'
     res.json(await remindctl(filter))
   } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
@@ -121,7 +163,7 @@ app.get('/reminders/lists', async (_req, res) => {
 })
 
 app.get('/reminders/lists/:name', async (req, res) => {
-  try { res.json(await remindctl('list', req.params.name)) }
+  try { res.json(await remindctl('list', assertNotFlag(req.params.name))) }
   catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
@@ -129,9 +171,10 @@ app.post('/reminders', async (req, res) => {
   try {
     const { title, list, due } = req.body
     if (!title) return res.status(400).json({ error: 'title required' })
-    const args = ['add', String(title).slice(0, MAX_STRING_LENGTH)]
-    if (list) args.push('--list', String(list).slice(0, 200))
-    if (due) args.push('--due', String(due).slice(0, 100))
+    const safeTitle = assertNotFlag(String(title).slice(0, MAX_STRING_LENGTH))
+    const args = ['add', safeTitle]
+    if (list) args.push('--list', assertNotFlag(String(list).slice(0, 200)))
+    if (due) args.push('--due', assertNotFlag(String(due).slice(0, 100)))
     res.json(await remindctl(...args))
   } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
@@ -139,14 +182,14 @@ app.post('/reminders', async (req, res) => {
 app.post('/reminders/complete', async (req, res) => {
   try {
     const { ids } = req.body
-    if (!ids?.length) return res.status(400).json({ error: 'ids required' })
-    const safeIds = ids.slice(0, MAX_ARRAY_LENGTH).map(id => String(id).slice(0, 200))
+    if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' })
+    const safeIds = ids.slice(0, MAX_ARRAY_LENGTH).map(id => assertNotFlag(String(id).slice(0, 200)))
     res.json(await remindctl('complete', ...safeIds))
   } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 app.delete('/reminders/:id', async (req, res) => {
-  try { res.json(await remindctl('delete', req.params.id, '--force')) }
+  try { res.json(await remindctl('delete', assertNotFlag(req.params.id), '--force')) }
   catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
@@ -157,8 +200,8 @@ app.delete('/reminders/:id', async (req, res) => {
 app.get('/notes', async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200)
-    const folder = req.query.folder || ''
-    const search = req.query.search || ''
+    const folder = String(Array.isArray(req.query.folder) ? req.query.folder[0] : req.query.folder || '')
+    const search = String(Array.isArray(req.query.search) ? req.query.search[0] : req.query.search || '')
 
     let script
     if (search) {
@@ -278,11 +321,11 @@ app.get('/contacts', async (req, res) => {
 
 // ── Contact photos (must be before /contacts/:id) ────────────────
 
-// Map: last 7 digits → /tmp/mc-avatar-XXXXXXX.tiff
+// Map: last 7 digits → private temp path
 const photoMap = new Map()
 
 async function buildPhotoCache() {
-  // Use AppleScript to export all contact photos to /tmp as TIFF, then convert to JPEG
+  // Use AppleScript to export all contact photos to private temp dir as TIFF, then convert to JPEG
   const script = `
     tell application "Contacts"
       set output to ""
@@ -296,14 +339,14 @@ async function buildPhotoCache() {
               set digits to do shell script "echo " & quoted form of rawNum & " | tr -cd '0-9'"
               if length of digits >= 7 then
                 set last7 to text ((length of digits) - 6) thru (length of digits) of digits
-                set tiffPath to "/tmp/mc-avatar-" & last7 & ".tiff"
+                set tiffPath to "${BRIDGE_TMP}/mc-avatar-" & last7 & ".tiff"
                 try
                   set fRef to open for access POSIX file tiffPath with write permission
                   set eof fRef to 0
                   write img to fRef
                   close access fRef
                   -- Convert TIFF to JPEG using sips
-                  do shell script "sips -s format jpeg " & quoted form of tiffPath & " --out /tmp/mc-avatar-" & last7 & ".jpg > /dev/null 2>&1 && rm -f " & quoted form of tiffPath
+                  do shell script "sips -s format jpeg " & quoted form of tiffPath & " --out ${BRIDGE_TMP}/mc-avatar-" & last7 & ".jpg > /dev/null 2>&1 && rm -f " & quoted form of tiffPath
                   set output to output & last7 & linefeed
                 end try
               end if
@@ -318,11 +361,11 @@ async function buildPhotoCache() {
     const result = await osascript(script)
     const keys = result.split('\n').filter(k => k.length === 7)
     for (const key of keys) {
-      photoMap.set(key, `/tmp/mc-avatar-${key}.jpg`)
+      photoMap.set(key, join(BRIDGE_TMP, `mc-avatar-${key}.jpg`))
     }
     console.log(`Photo cache built: ${photoMap.size} contact photos`)
   } catch (err) {
-    console.warn('Photo cache build failed:', err.message)
+    console.warn('Photo cache build failed:', safeError(err))
   }
 }
 
@@ -425,8 +468,9 @@ app.post('/messages/mark-read', async (req, res) => {
   if (!chatGuid || typeof chatGuid !== 'string') {
     return res.status(400).json({ error: 'chatGuid required' })
   }
-  // Validate chatGuid format to prevent injection (only allow safe chars)
-  if (!/^[a-zA-Z0-9_;+\-@.]+$/.test(chatGuid)) {
+  // Validate chatGuid matches iMessage GUID format: "iMessage;-;+1234567890" or "SMS;-;addr"
+  // Strict format prevents SQL injection (no quotes, backslashes, parens, or whitespace)
+  if (!/^(iMessage|SMS);[\-+];[a-zA-Z0-9_+\-@.]+$/.test(chatGuid) || chatGuid.length > 200) {
     return res.status(400).json({ error: 'Invalid chatGuid format' })
   }
 
@@ -439,7 +483,7 @@ app.post('/messages/mark-read', async (req, res) => {
     // date_read uses Apple Core Data nanoseconds since 2001-01-01
     // 978307200 = seconds between Unix epoch (1970) and Apple epoch (2001)
     const appleNow = (Math.floor(Date.now() / 1000) - 978307200) * 1000000000
-    // chatGuid is already validated by regex above (safe chars only)
+    // chatGuid is already validated by strict regex above (safe chars only)
     const sql = `UPDATE message SET date_read = ${appleNow}
       WHERE ROWID IN (
         SELECT m.ROWID FROM message m
@@ -453,7 +497,7 @@ app.post('/messages/mark-read', async (req, res) => {
     await execFileAsync('sqlite3', [dbPath, sql])
     res.json({ ok: true })
   } catch (err) {
-    console.error('mark-read error:', err.message)
+    console.error('mark-read error:', safeError(err))
     res.status(500).json({ error: safeError(err) })
   }
 })
@@ -516,7 +560,8 @@ app.get('/messages/attachment-raw', async (req, res) => {
 
     // HEIC/HEICS: convert to PNG using macOS sips (preserves alpha/transparency)
     if (ext2 === '.heic' || ext2 === '.heics') {
-      const tmpPng = `/tmp/mc-sticker-${guid}.png`
+      // Use private temp dir with random suffix to prevent symlink attacks
+      const tmpPng = join(BRIDGE_TMP, `sticker-${randomBytes(8).toString('hex')}.png`)
       try {
         await execAsync('sips', ['-s', 'format', 'png', resolved2, '--out', tmpPng], { timeout: 10000 })
         const pngData = await readFile(tmpPng)
@@ -544,7 +589,16 @@ app.get('/messages/attachment-raw', async (req, res) => {
 
 // ── Start ───────────────────────────────────────────────────────────
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`mac-bridge listening on 0.0.0.0:${PORT}`)
+// ── Global error handler (prevents Express from leaking stack traces) ──
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled error:', safeError(err))
+  res.status(500).json({ error: 'internal server error' })
+})
+
+const server = app.listen(PORT, '127.0.0.1', () => {
+  console.log(`mac-bridge listening on 127.0.0.1:${PORT}`)
   console.log('Services: reminders, notes, contacts, messages, findmy')
 })
+// Prevent slowloris DoS — headersTimeout must be > keepAliveTimeout per Node.js docs
+server.keepAliveTimeout = 30000
+server.headersTimeout = 35000

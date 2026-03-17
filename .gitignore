@@ -1,7 +1,10 @@
-node_modules/
-.env
-.env.local
-.env.*
 !.env.example
-*.log
 .DS_Store
+.env
+.env.*
+.env.local
+.security/
+*.log
+contacts-backup.*
+dedup-contacts.*
+node_modules/
