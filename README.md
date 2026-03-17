@@ -1,6 +1,21 @@
 # mac-bridge
 
-A lightweight REST bridge that exposes macOS-only services over HTTP. Designed to run on a Mac and be accessed remotely — e.g., from a Linux desktop over [Tailscale](https://tailscale.com).
+A lightweight REST bridge that exposes macOS-only services over HTTP — built for [Mission Control](https://github.com/Josue7211/mission-control).
+
+Mission Control is a cross-platform desktop app (Linux, macOS, Windows) that integrates iMessage, AI chat, task management, and more. Since Apple services like Reminders, Notes, Contacts, and Find My only have APIs on macOS, this bridge runs on a Mac and makes them available to Mission Control over the network via [Tailscale](https://tailscale.com).
+
+```
+┌──────────────────────┐         Tailscale          ┌─────────────────┐
+│  Any Desktop         │◄──────────────────────────►│  Mac             │
+│  (Linux/macOS/Win)   │          HTTP               │                 │
+│                      │                             │  mac-bridge      │
+│  Mission Control     │  GET /reminders ──────────► │  ├─ Reminders    │
+│  (Tauri app)         │  GET /notes ──────────────► │  ├─ Notes        │
+│                      │  GET /contacts ───────────► │  ├─ Contacts     │
+│                      │  GET /findmy/devices ─────► │  ├─ Find My      │
+│                      │  POST /messages/mark-read ► │  └─ Messages     │
+└──────────────────────┘                             └─────────────────┘
+```
 
 ## Services
 
@@ -43,6 +58,14 @@ BRIDGE_API_KEY=your-secret-key-here
 ```bash
 npm start        # production
 npm run dev      # development (auto-restart on changes)
+```
+
+### Connecting to Mission Control
+
+In Mission Control, go to **Settings → Connections** and set the mac-bridge URL to your Mac's Tailscale IP:
+
+```
+http://100.x.x.x:4100
 ```
 
 ## API
