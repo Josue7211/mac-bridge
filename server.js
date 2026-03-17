@@ -3,15 +3,27 @@ import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { homedir } from 'os'
 import { join, resolve, extname } from 'path'
+import { createHash, timingSafeEqual } from 'crypto'
 
 const execFileP = promisify(execFile)
 const app = express()
 
+// ── Input limits ────────────────────────────────────────────────────
+const MAX_STRING_LENGTH = 10000
+const MAX_ARRAY_LENGTH = 100
+
 // Sanitize user input for safe interpolation into JXA/AppleScript double-quoted strings
 function safeJxaString(s) {
-  return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '')
+  return String(s)
+    .slice(0, MAX_STRING_LENGTH)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '')
+    .replace(/\0/g, '')     // strip null bytes
 }
-app.use(express.json())
+
+app.use(express.json({ limit: '1mb' }))
 
 const PORT = process.env.BRIDGE_PORT || 4100
 const API_KEY = process.env.BRIDGE_API_KEY || ''
@@ -19,15 +31,56 @@ const HOME = homedir()
 
 // ── Auth middleware ─────────────────────────────────────────────────
 
-if (API_KEY) {
-  app.use((req, res, next) => {
-    const key = req.headers['x-api-key'] || req.query.api_key
-    if (key !== API_KEY) return res.status(401).json({ error: 'unauthorized' })
-    next()
-  })
+if (!API_KEY) {
+  console.error('FATAL: BRIDGE_API_KEY is not set. Refusing to start without auth.')
+  process.exit(1)
 }
 
+// Simple in-memory rate limiter
+const rateBuckets = new Map()
+function rateLimit(key, maxPerMinute) {
+  const now = Date.now()
+  const bucket = rateBuckets.get(key) || { count: 0, resetAt: now + 60000 }
+  if (now > bucket.resetAt) { bucket.count = 0; bucket.resetAt = now + 60000 }
+  bucket.count++
+  rateBuckets.set(key, bucket)
+  return bucket.count > maxPerMinute
+}
+
+app.use((req, res, next) => {
+  const key = req.headers['x-api-key'] || req.query.api_key || ''
+  // Constant-time comparison to prevent timing attacks
+  if (typeof key !== 'string' || key.length === 0) {
+    return res.status(401).json({ error: 'unauthorized' })
+  }
+  try {
+    const keyBuf = Buffer.from(key, 'utf-8')
+    const expectedBuf = Buffer.from(API_KEY, 'utf-8')
+    // timingSafeEqual requires same length — hash both to normalize
+    const keyHash = createHash('sha256').update(keyBuf).digest()
+    const expectedHash = createHash('sha256').update(expectedBuf).digest()
+    if (!timingSafeEqual(keyHash, expectedHash)) {
+      return res.status(401).json({ error: 'unauthorized' })
+    }
+  } catch {
+    return res.status(401).json({ error: 'unauthorized' })
+  }
+  // Rate limit: 60 requests per minute per IP
+  const clientIp = req.ip || 'unknown'
+  if (rateLimit(clientIp, 60)) {
+    return res.status(429).json({ error: 'rate limit exceeded' })
+  }
+  next()
+})
+
 // ── Helpers ─────────────────────────────────────────────────────────
+
+// Sanitize error messages to prevent internal detail leakage
+function safeError(err) {
+  const msg = String(err?.message || 'unknown error')
+  // Strip file paths and stack traces
+  return msg.replace(/\/Users\/[^\s:]+/g, '<redacted-path>').slice(0, 200)
+}
 
 async function remindctl(...args) {
   const { stdout } = await execFileP('remindctl', [...args, '--json'], { timeout: 10000 })
@@ -59,41 +112,42 @@ app.get('/reminders', async (req, res) => {
   try {
     const filter = req.query.filter || 'all'
     res.json(await remindctl(filter))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 app.get('/reminders/lists', async (_req, res) => {
   try { res.json(await remindctl('list')) }
-  catch (err) { res.status(500).json({ error: err.message }) }
+  catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 app.get('/reminders/lists/:name', async (req, res) => {
   try { res.json(await remindctl('list', req.params.name)) }
-  catch (err) { res.status(500).json({ error: err.message }) }
+  catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 app.post('/reminders', async (req, res) => {
   try {
     const { title, list, due } = req.body
     if (!title) return res.status(400).json({ error: 'title required' })
-    const args = ['add', title]
-    if (list) args.push('--list', list)
-    if (due) args.push('--due', due)
+    const args = ['add', String(title).slice(0, MAX_STRING_LENGTH)]
+    if (list) args.push('--list', String(list).slice(0, 200))
+    if (due) args.push('--due', String(due).slice(0, 100))
     res.json(await remindctl(...args))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 app.post('/reminders/complete', async (req, res) => {
   try {
     const { ids } = req.body
     if (!ids?.length) return res.status(400).json({ error: 'ids required' })
-    res.json(await remindctl('complete', ...ids))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+    const safeIds = ids.slice(0, MAX_ARRAY_LENGTH).map(id => String(id).slice(0, 200))
+    res.json(await remindctl('complete', ...safeIds))
+  } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 app.delete('/reminders/:id', async (req, res) => {
   try { res.json(await remindctl('delete', req.params.id, '--force')) }
-  catch (err) { res.status(500).json({ error: err.message }) }
+  catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 // ═══════════════════════════════════════════════════════════════════
@@ -102,7 +156,7 @@ app.delete('/reminders/:id', async (req, res) => {
 
 app.get('/notes', async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 50
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200)
     const folder = req.query.folder || ''
     const search = req.query.search || ''
 
@@ -140,7 +194,7 @@ app.get('/notes', async (req, res) => {
       `
     }
     res.json(await jxa(script))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 app.get('/notes/folders', async (_req, res) => {
@@ -150,7 +204,7 @@ app.get('/notes/folders', async (_req, res) => {
       JSON.stringify(Notes.folders().map(f => ({ name: f.name(), count: f.notes().length })))
     `
     res.json(await jxa(script))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 app.get('/notes/:id', async (req, res) => {
@@ -167,7 +221,7 @@ app.get('/notes/:id', async (req, res) => {
       })
     `
     res.json(await jxa(script))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 app.post('/notes', async (req, res) => {
@@ -181,7 +235,7 @@ app.post('/notes', async (req, res) => {
       : 'default account of application "Notes"'
     await osascript(`tell application "Notes" to make new note at ${target} with properties {name:"${safeTitle}", body:"${safeBody}"}`)
     res.json({ ok: true })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 // ═══════════════════════════════════════════════════════════════════
@@ -191,7 +245,7 @@ app.post('/notes', async (req, res) => {
 app.get('/contacts', async (req, res) => {
   try {
     const search = req.query.search || ''
-    const limit = parseInt(req.query.limit) || 30
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 30, 1), 200)
     let script
     if (search) {
       const safe = safeJxaString(search)
@@ -219,7 +273,7 @@ app.get('/contacts', async (req, res) => {
       `
     }
     res.json(await jxa(script))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 // ── Contact photos (must be before /contacts/:id) ────────────────
@@ -309,7 +363,7 @@ app.get('/contacts/:id', async (req, res) => {
       })
     `
     res.json(await jxa(script))
-  } catch (err) { res.status(500).json({ error: err.message }) }
+  } catch (err) { res.status(500).json({ error: safeError(err) }) }
 })
 
 // ═══════════════════════════════════════════════════════════════════
@@ -400,7 +454,7 @@ app.post('/messages/mark-read', async (req, res) => {
     res.json({ ok: true })
   } catch (err) {
     console.error('mark-read error:', err.message)
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: safeError(err) })
   }
 })
 
@@ -442,7 +496,9 @@ app.get('/messages/attachment-raw', async (req, res) => {
 
     // Strategy 2: search by original filename directly
     if (!foundFile && originalName) {
-      const { stdout: stdout2 } = await execAsync('find', [attachDir, '-type', 'f', '-name', originalName, '-maxdepth', '5'], { timeout: 5000 }).catch(() => ({ stdout: '' }))
+      // Sanitize originalName to prevent path traversal in find
+      const safeName = String(originalName).replace(/[^a-zA-Z0-9._\-]/g, '_').slice(0, 200)
+      const { stdout: stdout2 } = await execAsync('find', [attachDir, '-type', 'f', '-name', safeName, '-maxdepth', '5'], { timeout: 5000 }).catch(() => ({ stdout: '' }))
       const files2 = stdout2.trim().split('\n').filter(Boolean)
       if (files2.length > 0) foundFile = files2[0]
     }
@@ -491,5 +547,4 @@ app.get('/messages/attachment-raw', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`mac-bridge listening on 0.0.0.0:${PORT}`)
   console.log('Services: reminders, notes, contacts, messages, findmy')
-  if (!API_KEY) console.warn('Warning: No BRIDGE_API_KEY set — running without auth')
 })
