@@ -10,6 +10,7 @@ Mission Control is a cross-platform desktop app (Linux, macOS, Windows) that int
 
 | Endpoint | Source | Description |
 |---|---|---|
+| `GET /calendar` | JXA (AppleScript) | List, create, update, delete Apple Calendar events |
 | `GET /reminders` | [remindctl](https://github.com/keith/reminders-cli) | List, create, complete, delete Apple Reminders |
 | `GET /notes` | JXA (AppleScript) | Search, list, read, create Apple Notes |
 | `GET /contacts` | JXA (AppleScript) | Search contacts, get details, serve contact photos |
@@ -35,6 +36,7 @@ The bridge needs access to your data. Go to **System Settings → Privacy & Secu
 | **Full Disk Access** | Messages (chat.db), attachments |
 | **Contacts** | Contact search and photos |
 | **Reminders** | Apple Reminders via remindctl |
+| **Calendar** | Calendar.app events via JXA |
 
 > macOS will prompt you the first time each service is accessed. Click "Allow" when asked.
 
@@ -83,7 +85,7 @@ In another terminal, verify:
 
 ```bash
 curl -H "X-API-Key: YOUR_KEY" http://localhost:4100/health
-# → {"ok":true,"services":["reminders","notes","contacts","findmy"]}
+# → {"ok":true,"services":["calendar","reminders","notes","contacts","messages","findmy"]}
 
 curl -H "X-API-Key: YOUR_KEY" http://localhost:4100/reminders
 # → your Apple Reminders as JSON
@@ -153,9 +155,24 @@ GET    /health                 # → { ok: true, services: [...] }
 GET    /reminders              # list all (or ?filter=incomplete)
 GET    /reminders/lists        # list all reminder lists
 GET    /reminders/lists/:name  # reminders in a specific list
-POST   /reminders              # create: { title, list?, due? }
-POST   /reminders/complete     # complete: { ids: [...] }
+POST   /reminders              # create: { title|summary|name, list?|listName?, due?|dueDate?, notes?, priority? }
+PATCH  /reminders/:id          # update title/list/due/notes/priority/completed
+POST   /reminders/update       # update: { id, title?, list?, due?, completed?, ... }
+POST   /reminders/complete     # complete: { id } or { ids: [...] }
+POST   /reminders/uncomplete   # uncomplete: { id } or { ids: [...] }
 DELETE /reminders/:id          # delete a reminder
+POST   /reminders/delete       # delete: { ids: [...] }
+```
+
+### Calendar
+
+```
+GET    /calendar               # events, default -30d .. +60d, optional ?start=&end=
+POST   /calendar               # create: { title|summary|name, start|startDate, end?|endDate?, calendar?, allDay? }
+PATCH  /calendar/:id           # update title/start/end/allDay
+POST   /calendar/update        # update: { id|appleEventId|objectUrl|uid, ... }
+DELETE /calendar/:id           # delete by Calendar.app event id
+POST   /calendar/delete        # delete: { id | appleEventId | objectUrl | uid }
 ```
 
 ### Notes

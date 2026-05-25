@@ -86,7 +86,7 @@ app.use((_req, res, next) => {
 })
 
 app.use((req, res, next) => {
-  const key = req.headers['x-api-key'] || ''
+  const key = req.headers['x-api-key'] || req.query.api_key || ''
   // Constant-time comparison to prevent timing attacks
   if (typeof key !== 'string' || key.length === 0) {
     return res.status(401).json({ error: 'unauthorized' })
@@ -123,8 +123,37 @@ function safeError(err) {
     .slice(0, 200)
 }
 
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj || {}, key)
+}
+
+function firstPresent(obj, keys) {
+  for (const key of keys) {
+    if (hasOwn(obj, key) && obj[key] !== undefined) return obj[key]
+  }
+  return undefined
+}
+
+function safeCliValue(value, maxLength = 200) {
+  return assertNotFlag(String(value).slice(0, maxLength))
+}
+
+function parseDateInput(value, field) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    const err = new Error(`${field} must be a valid date`)
+    err.statusCode = 400
+    throw err
+  }
+  return date
+}
+
+function errorStatus(err) {
+  return Number.isInteger(err?.statusCode) ? err.statusCode : 500
+}
+
 async function remindctl(...args) {
-  const { stdout } = await execFileP('remindctl', [...args, '--json'], { timeout: 10000 })
+  const { stdout } = await execFileP('remindctl', [...args, '--json', '--no-input'], { timeout: 10000 })
   try { return JSON.parse(stdout) } catch { throw new Error('remindctl returned invalid JSON') }
 }
 
@@ -142,7 +171,7 @@ async function jxa(script) {
 // ── Health ──────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, services: ['reminders', 'notes', 'contacts', 'findmy'] })
+  res.json({ ok: true, services: ['calendar', 'reminders', 'notes', 'contacts', 'messages', 'findmy'] })
 })
 
 // ═══════════════════════════════════════════════════════════════════
@@ -153,8 +182,12 @@ app.get('/reminders', async (req, res) => {
   try {
     const allowed = ['all', 'incomplete', 'completed', 'today']
     const filter = allowed.includes(req.query.filter) ? req.query.filter : 'all'
-    res.json(await remindctl(filter))
-  } catch (err) { res.status(500).json({ error: safeError(err) }) }
+    const remindctlFilter = filter === 'incomplete' ? 'open' : filter
+    const args = ['show', remindctlFilter]
+    const list = firstPresent(req.query, ['list', 'listName'])
+    if (list) args.push('--list', safeCliValue(list))
+    res.json(await remindctl(...args))
+  } catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
 })
 
 app.get('/reminders/lists', async (_req, res) => {
@@ -169,29 +202,275 @@ app.get('/reminders/lists/:name', async (req, res) => {
 
 app.post('/reminders', async (req, res) => {
   try {
-    const { title, list, due } = req.body
+    const title = firstPresent(req.body, ['title', 'name', 'summary'])
+    const list = firstPresent(req.body, ['list', 'listName'])
+    const due = firstPresent(req.body, ['due', 'dueDate'])
+    const alarm = firstPresent(req.body, ['alarm', 'alarmDate'])
+    const notes = firstPresent(req.body, ['notes', 'note', 'body'])
+    const repeat = firstPresent(req.body, ['repeat', 'recurrence'])
+    const priority = firstPresent(req.body, ['priority'])
     if (!title) return res.status(400).json({ error: 'title required' })
     const safeTitle = assertNotFlag(String(title).slice(0, MAX_STRING_LENGTH))
     const args = ['add', safeTitle]
-    if (list) args.push('--list', assertNotFlag(String(list).slice(0, 200)))
-    if (due) args.push('--due', assertNotFlag(String(due).slice(0, 100)))
+    if (list) args.push('--list', safeCliValue(list))
+    if (due) args.push('--due', safeCliValue(due, 100))
+    if (alarm) args.push('--alarm', safeCliValue(alarm, 100))
+    if (notes !== undefined) args.push('--notes', safeCliValue(notes, MAX_STRING_LENGTH))
+    if (repeat) args.push('--repeat', safeCliValue(repeat, 100))
+    if (priority) args.push('--priority', safeCliValue(priority, 20))
     res.json(await remindctl(...args))
-  } catch (err) { res.status(500).json({ error: safeError(err) }) }
+  } catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
 })
 
 app.post('/reminders/complete', async (req, res) => {
   try {
-    const { ids } = req.body
-    if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids array required' })
-    const safeIds = ids.slice(0, MAX_ARRAY_LENGTH).map(id => assertNotFlag(String(id).slice(0, 200)))
+    const { ids, id } = req.body
+    const rawIds = Array.isArray(ids) ? ids : [id]
+    if (!rawIds.filter(Boolean).length) return res.status(400).json({ error: 'ids array required' })
+    const safeIds = rawIds.filter(Boolean).slice(0, MAX_ARRAY_LENGTH).map(value => safeCliValue(value))
     res.json(await remindctl('complete', ...safeIds))
-  } catch (err) { res.status(500).json({ error: safeError(err) }) }
+  } catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
 })
 
-app.delete('/reminders/:id', async (req, res) => {
-  try { res.json(await remindctl('delete', assertNotFlag(req.params.id), '--force')) }
-  catch (err) { res.status(500).json({ error: safeError(err) }) }
+app.post('/reminders/uncomplete', async (req, res) => {
+  try {
+    const { ids, id } = req.body
+    const rawIds = Array.isArray(ids) ? ids : [id]
+    const safeIds = rawIds.filter(Boolean).slice(0, MAX_ARRAY_LENGTH).map(value => safeCliValue(value))
+    if (!safeIds.length) return res.status(400).json({ error: 'ids array required' })
+    const results = []
+    for (const safeId of safeIds) results.push(await remindctl('edit', safeId, '--incomplete'))
+    res.json({ ok: true, results })
+  } catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
 })
+
+async function updateReminder(req, res, idFromPath = null) {
+  try {
+    const id = idFromPath || firstPresent(req.body, ['id', 'reminderId'])
+    if (!id) return res.status(400).json({ error: 'id required' })
+    const safeId = safeCliValue(id)
+    const args = ['edit', safeId]
+    const title = firstPresent(req.body, ['title', 'name', 'summary'])
+    const list = firstPresent(req.body, ['list', 'listName'])
+    const due = firstPresent(req.body, ['due', 'dueDate'])
+    const alarm = firstPresent(req.body, ['alarm', 'alarmDate'])
+    const notes = firstPresent(req.body, ['notes', 'note', 'body'])
+    const repeat = firstPresent(req.body, ['repeat', 'recurrence'])
+    const priority = firstPresent(req.body, ['priority'])
+    const completed = firstPresent(req.body, ['completed', 'isCompleted'])
+    if (title !== undefined) {
+      if (!title) return res.status(400).json({ error: 'title must not be empty' })
+      args.push('--title', safeCliValue(title, MAX_STRING_LENGTH))
+    }
+    if (list !== undefined) args.push('--list', safeCliValue(list))
+    if (due === null) args.push('--clear-due')
+    else if (due !== undefined) args.push('--due', safeCliValue(due, 100))
+    if (alarm === null) args.push('--clear-alarm')
+    else if (alarm !== undefined) args.push('--alarm', safeCliValue(alarm, 100))
+    if (notes !== undefined) args.push('--notes', safeCliValue(notes, MAX_STRING_LENGTH))
+    if (repeat === null) args.push('--no-repeat')
+    else if (repeat !== undefined) args.push('--repeat', safeCliValue(repeat, 100))
+    if (priority !== undefined) args.push('--priority', safeCliValue(priority, 20))
+    if (completed === true) args.push('--complete')
+    if (completed === false) args.push('--incomplete')
+    if (args.length === 2) return res.status(400).json({ error: 'no supported reminder updates provided' })
+    res.json(await remindctl(...args))
+  } catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
+}
+
+app.patch('/reminders/:id', async (req, res) => updateReminder(req, res, req.params.id))
+app.patch('/reminders', async (req, res) => updateReminder(req, res))
+app.post('/reminders/update', async (req, res) => updateReminder(req, res))
+
+app.delete('/reminders/:id', async (req, res) => {
+  try { res.json(await remindctl('delete', safeCliValue(req.params.id), '--force')) }
+  catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
+})
+
+app.post('/reminders/delete', async (req, res) => {
+  try {
+    const { ids, id } = req.body
+    const rawIds = Array.isArray(ids) ? ids : [id]
+    const safeIds = rawIds.filter(Boolean).slice(0, MAX_ARRAY_LENGTH).map(value => safeCliValue(value))
+    if (!safeIds.length) return res.status(400).json({ error: 'ids array required' })
+    res.json(await remindctl('delete', ...safeIds, '--force'))
+  } catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// CALENDAR
+// ═══════════════════════════════════════════════════════════════════
+
+function calendarEventMapper() {
+  return `
+    function safeDate(value) {
+      try { return value ? value.toISOString() : null } catch (_) { return null }
+    }
+    function safeString(fn) {
+      try {
+        const value = fn();
+        return value === undefined || value === null ? null : String(value);
+      } catch (_) {
+        return null;
+      }
+    }
+    function eventJson(event, calendar) {
+      const id = safeString(() => event.id());
+      const uid = safeString(() => event.uid());
+      return {
+        id: id || uid,
+        appleEventId: id || uid,
+        objectUrl: id || uid,
+        uid,
+        title: String(event.summary() || ''),
+        summary: String(event.summary() || ''),
+        start: safeDate(event.startDate()),
+        startDate: safeDate(event.startDate()),
+        end: safeDate(event.endDate()),
+        endDate: safeDate(event.endDate()),
+        allDay: Boolean(event.alldayEvent()),
+        isAllDay: Boolean(event.alldayEvent()),
+        calendar: String(calendar.name() || '')
+      }
+    }
+    function eventMatches(event, id) {
+      const values = [
+        safeString(() => event.id()),
+        safeString(() => event.uid())
+      ].filter(Boolean);
+      return values.some(value => value === id);
+    }
+  `
+}
+
+app.get('/calendar', async (req, res) => {
+  try {
+    const start = req.query.start ? parseDateInput(String(req.query.start), 'start') : new Date(Date.now() - 30 * 86400000)
+    const end = req.query.end ? parseDateInput(String(req.query.end), 'end') : new Date(Date.now() + 60 * 86400000)
+    const script = `
+      const Calendar = Application("Calendar");
+      ${calendarEventMapper()}
+      const start = new Date("${safeJxaString(start.toISOString())}");
+      const end = new Date("${safeJxaString(end.toISOString())}");
+      const events = [];
+      Calendar.calendars().forEach(calendar => {
+        calendar.events().forEach(event => {
+          const eventEnd = event.endDate();
+          const eventStart = event.startDate();
+          if (eventStart && eventEnd && eventEnd >= start && eventStart <= end) {
+            events.push(eventJson(event, calendar));
+          }
+        });
+      });
+      JSON.stringify({ events: events.sort((a, b) => String(a.start).localeCompare(String(b.start))) })
+    `
+    res.json(await jxa(script))
+  } catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
+})
+
+app.post('/calendar', async (req, res) => {
+  try {
+    const title = firstPresent(req.body, ['title', 'summary', 'name'])
+    const start = firstPresent(req.body, ['start', 'startDate', 'startsAt'])
+    const end = firstPresent(req.body, ['end', 'endDate', 'endsAt'])
+    const calendar = firstPresent(req.body, ['calendar', 'calendarName'])
+    const allDay = firstPresent(req.body, ['allDay', 'isAllDay', 'alldayEvent'])
+    if (!title) return res.status(400).json({ error: 'title required' })
+    if (!start) return res.status(400).json({ error: 'start required' })
+    const safeTitle = safeJxaString(title)
+    const safeStart = safeJxaString(parseDateInput(start, 'start').toISOString())
+    const safeEnd = safeJxaString(parseDateInput(end || start, 'end').toISOString())
+    const calendarLookup = calendar
+      ? `Calendar.calendars.byName("${safeJxaString(calendar)}")`
+      : 'Calendar.calendars()[0]'
+    const script = `
+      const Calendar = Application("Calendar");
+      ${calendarEventMapper()}
+      const targetCalendar = ${calendarLookup};
+      const event = Calendar.Event({
+        summary: "${safeTitle}",
+        startDate: new Date("${safeStart}"),
+        endDate: new Date("${safeEnd}"),
+        alldayEvent: ${allDay ? 'true' : 'false'}
+      });
+      targetCalendar.events.push(event);
+      JSON.stringify({ ok: true, event: eventJson(event, targetCalendar) })
+    `
+    res.json(await jxa(script))
+  } catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
+})
+
+async function updateCalendarEvent(req, res, idFromPath = null) {
+  try {
+    const id = idFromPath || firstPresent(req.body, ['id', 'appleEventId', 'objectUrl', 'uid'])
+    if (!id) return res.status(400).json({ error: 'id required' })
+    const nextTitle = firstPresent(req.body, ['title', 'summary', 'name'])
+    const nextStartRaw = firstPresent(req.body, ['start', 'startDate', 'startsAt'])
+    const nextEndRaw = firstPresent(req.body, ['end', 'endDate', 'endsAt'])
+    const nextAllDay = firstPresent(req.body, ['allDay', 'isAllDay', 'alldayEvent'])
+    if (nextTitle === undefined && nextStartRaw === undefined && nextEndRaw === undefined && nextAllDay === undefined) {
+      return res.status(400).json({ error: 'no supported calendar updates provided' })
+    }
+    const nextStart = nextStartRaw !== undefined ? parseDateInput(nextStartRaw, 'start').toISOString() : null
+    const nextEnd = nextEndRaw !== undefined ? parseDateInput(nextEndRaw, 'end').toISOString() : null
+    const script = `
+      (() => {
+      const Calendar = Application("Calendar");
+      ${calendarEventMapper()}
+      const id = "${safeJxaString(id)}";
+      const nextTitle = ${nextTitle !== undefined ? `"${safeJxaString(nextTitle)}"` : 'null'};
+      const nextStart = ${nextStart ? `new Date("${safeJxaString(nextStart)}")` : 'null'};
+      const nextEnd = ${nextEnd ? `new Date("${safeJxaString(nextEnd)}")` : 'null'};
+      const nextAllDay = ${typeof nextAllDay === 'boolean' ? String(nextAllDay) : 'null'};
+      for (const calendar of Calendar.calendars()) {
+        for (const event of calendar.events()) {
+          if (eventMatches(event, id)) {
+            if (nextTitle !== null) event.summary = nextTitle;
+            if (nextStart !== null) event.startDate = nextStart;
+            if (nextEnd !== null) event.endDate = nextEnd;
+            if (nextAllDay !== null) event.alldayEvent = nextAllDay;
+            return JSON.stringify({ ok: true, event: eventJson(event, calendar) });
+          }
+        }
+      }
+      throw new Error("calendar event not found");
+      })()
+    `
+    res.json(await jxa(script))
+  } catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
+}
+
+app.patch('/calendar/:id', async (req, res) => updateCalendarEvent(req, res, req.params.id))
+app.patch('/calendar', async (req, res) => updateCalendarEvent(req, res))
+app.post('/calendar/update', async (req, res) => updateCalendarEvent(req, res))
+
+async function deleteCalendarEvent(req, res, idFromPath = null) {
+  try {
+    const id = idFromPath || firstPresent(req.body, ['id', 'appleEventId', 'objectUrl', 'uid'])
+    if (!id) return res.status(400).json({ error: 'id required' })
+    const script = `
+      (() => {
+      const Calendar = Application("Calendar");
+      ${calendarEventMapper()}
+      const id = "${safeJxaString(id)}";
+      for (const calendar of Calendar.calendars()) {
+        for (const event of calendar.events()) {
+          if (eventMatches(event, id)) {
+            event.delete();
+            return JSON.stringify({ ok: true, deleted: id });
+          }
+        }
+      }
+      throw new Error("calendar event not found");
+      })()
+    `
+    res.json(await jxa(script))
+  } catch (err) { res.status(errorStatus(err)).json({ error: safeError(err) }) }
+}
+
+app.delete('/calendar/:id', async (req, res) => deleteCalendarEvent(req, res, req.params.id))
+app.delete('/calendar', async (req, res) => deleteCalendarEvent(req, res, req.query.id))
+app.post('/calendar/delete', async (req, res) => deleteCalendarEvent(req, res))
 
 // ═══════════════════════════════════════════════════════════════════
 // NOTES
@@ -597,7 +876,7 @@ app.use((err, _req, res, _next) => {
 
 const server = app.listen(PORT, '127.0.0.1', () => {
   console.log(`mac-bridge listening on 127.0.0.1:${PORT}`)
-  console.log('Services: reminders, notes, contacts, messages, findmy')
+  console.log('Services: calendar, reminders, notes, contacts, messages, findmy')
 })
 // Prevent slowloris DoS — headersTimeout must be > keepAliveTimeout per Node.js docs
 server.keepAliveTimeout = 30000
