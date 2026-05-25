@@ -14,9 +14,11 @@ fi
 # Load .env if it exists
 if [ -f "$BRIDGE_DIR/.env" ]; then
   BRIDGE_PORT=$(grep -E '^BRIDGE_PORT=' "$BRIDGE_DIR/.env" | cut -d= -f2)
+  BRIDGE_HOST=$(grep -E '^BRIDGE_HOST=' "$BRIDGE_DIR/.env" | cut -d= -f2)
   BRIDGE_API_KEY=$(grep -E '^BRIDGE_API_KEY=' "$BRIDGE_DIR/.env" | cut -d= -f2)
 fi
 BRIDGE_PORT="${BRIDGE_PORT:-4100}"
+BRIDGE_HOST="${BRIDGE_HOST:-127.0.0.1}"
 
 # Warn if no API key
 if [ -z "$BRIDGE_API_KEY" ]; then
@@ -56,8 +58,12 @@ cat > "$PLIST_PATH" <<EOF
     <dict>
         <key>BRIDGE_PORT</key>
         <string>$BRIDGE_PORT</string>
+        <key>BRIDGE_HOST</key>
+        <string>$BRIDGE_HOST</string>
         <key>BRIDGE_API_KEY</key>
         <string>${BRIDGE_API_KEY}</string>
+        <key>PATH</key>
+        <string>/Volumes/T7/.tools/bin:/Applications/Codex.app/Contents/Resources:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -76,7 +82,7 @@ launchctl load "$PLIST_PATH"
 
 echo ""
 echo "mac-bridge installed and running."
-echo "  Port: $BRIDGE_PORT"
+echo "  Bind: $BRIDGE_HOST:$BRIDGE_PORT"
 echo "  Logs: /tmp/mac-bridge.log"
 echo "  Plist: $PLIST_PATH"
 echo ""

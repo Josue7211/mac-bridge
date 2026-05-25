@@ -48,6 +48,7 @@ function assertNotFlag(s) {
 app.use(express.json({ limit: '1mb' }))
 
 const PORT = process.env.BRIDGE_PORT || 4100
+const HOST = process.env.BRIDGE_HOST || '127.0.0.1'
 const API_KEY = process.env.BRIDGE_API_KEY || ''
 const HOME = homedir()
 
@@ -874,8 +875,8 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'internal server error' })
 })
 
-const server = app.listen(PORT, '127.0.0.1', () => {
-  console.log(`mac-bridge listening on 127.0.0.1:${PORT}`)
+const server = app.listen(PORT, HOST, () => {
+  console.log(`mac-bridge listening on ${HOST}:${PORT}`)
   console.log('Services: calendar, reminders, notes, contacts, messages, findmy')
 })
 // Prevent slowloris DoS — headersTimeout must be > keepAliveTimeout per Node.js docs

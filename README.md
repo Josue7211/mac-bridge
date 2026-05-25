@@ -1,8 +1,8 @@
 # mac-bridge
 
-A lightweight REST bridge that exposes macOS-only services over HTTP — built for [Mission Control](https://github.com/Josue7211/mission-control).
+A lightweight REST bridge that exposes macOS-only services over HTTP — built for [clawctrl](https://github.com/Josue7211/clawcontrol).
 
-Mission Control is a cross-platform desktop app (Linux, macOS, Windows) that integrates iMessage, AI chat, task management, and more. Since Apple services like Reminders, Notes, Contacts, and Find My only have APIs on macOS, this bridge runs on a Mac and makes them available to Mission Control over the network via [Tailscale](https://tailscale.com).
+clawctrl is a cross-platform desktop app (Linux, macOS, Windows) that integrates iMessage, AI chat, task management, and more. Since Apple services like Reminders, Notes, Contacts, and Find My only have APIs on macOS, this bridge runs on a Mac and makes them available to clawctrl over the network via [Tailscale](https://tailscale.com).
 
 <p align="center"><img src="docs/architecture.png" width="680" alt="Architecture"></p>
 
@@ -60,7 +60,7 @@ openssl rand -hex 32
 
 Copy the output — you'll need it in two places:
 1. The bridge config (`.env` on your Mac)
-2. Mission Control (Settings → Connections → mac-bridge API key)
+2. clawctrl (Settings → Connections → mac-bridge API key)
 
 ### 4. Configure
 
@@ -124,9 +124,9 @@ launchctl load ~/Library/LaunchAgents/com.mac-bridge.plist
 ./install.sh
 ```
 
-### 7. Connect Mission Control
+### 7. Connect clawctrl
 
-In Mission Control on your desktop, go to **Settings → Connections** and set:
+In clawctrl on your desktop, go to **Settings → Connections** and set:
 
 - **mac-bridge URL:** `http://<your-mac-tailscale-ip>:4100`
 - **mac-bridge API key:** the same key you generated in step 3
